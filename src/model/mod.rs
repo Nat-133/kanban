@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 use time::OffsetDateTime;
@@ -106,6 +107,89 @@ impl<'de> Deserialize<'de> for ColumnId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Column {
+    pub id: ColumnId,
+    pub title: String,
+}
+
+/// Wire shape (mirrors board.yaml exactly). Public, structural — no invariants.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawBoard {
+    pub api_version: ApiVersion,
+    pub kind: BoardKind,
+    pub metadata: Metadata,
+    pub spec: RawBoardSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RawBoardSpec {
+    pub columns: Vec<Column>,
+    pub cards: BTreeMap<ColumnId, Vec<TaskId>>,
+}
+
+/// Domain Board: private fields, only constructable via TryFrom<RawBoard>.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawBoard", into = "RawBoard")]
+pub struct Board {
+    metadata: Metadata,
+    columns: Vec<Column>,
+    cards: BTreeMap<ColumnId, Vec<TaskId>>,
+}
+
+impl Board {
+    pub fn metadata(&self) -> &Metadata { &self.metadata }
+    pub fn columns(&self) -> &[Column] { &self.columns }
+    pub fn cards(&self) -> &BTreeMap<ColumnId, Vec<TaskId>> { &self.cards }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BoardError {
+    #[error("duplicate column id: {0}")]
+    DuplicateColumn(ColumnId),
+    #[error("card {task} placed in unknown column {column}")]
+    UnknownColumn { task: TaskId, column: ColumnId },
+    #[error("task {0} appears in more than one column")]
+    DuplicateTask(TaskId),
+}
+
+impl TryFrom<RawBoard> for Board {
+    type Error = BoardError;
+    fn try_from(raw: RawBoard) -> Result<Self, BoardError> {
+        let mut known = BTreeSet::new();
+        for col in &raw.spec.columns {
+            if !known.insert(col.id.clone()) {
+                return Err(BoardError::DuplicateColumn(col.id.clone()));
+            }
+        }
+        let mut seen = BTreeSet::new();
+        for (column, tasks) in &raw.spec.cards {
+            if !known.contains(column) {
+                let task = tasks.first().copied().unwrap_or(TaskId::new(0));
+                return Err(BoardError::UnknownColumn { task, column: column.clone() });
+            }
+            for &t in tasks {
+                if !seen.insert(t) {
+                    return Err(BoardError::DuplicateTask(t));
+                }
+            }
+        }
+        Ok(Board { metadata: raw.metadata, columns: raw.spec.columns, cards: raw.spec.cards })
+    }
+}
+
+impl From<Board> for RawBoard {
+    fn from(b: Board) -> RawBoard {
+        RawBoard {
+            api_version: ApiVersion::V1Alpha1,
+            kind: BoardKind::Board,
+            metadata: b.metadata,
+            spec: RawBoardSpec { columns: b.columns, cards: b.cards },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +238,47 @@ labels:
     fn column_id_rejects_empty() {
         assert!("inbox".parse::<ColumnId>().is_ok());
         assert!("".parse::<ColumnId>().is_err());
+    }
+
+    fn raw_board(cards: &[(&str, &[&str])], cols: &[&str]) -> RawBoard {
+        RawBoard {
+            api_version: ApiVersion::V1Alpha1,
+            kind: BoardKind::Board,
+            metadata: Metadata { name: "default".into(), creation_timestamp: None, labels: Default::default() },
+            spec: RawBoardSpec {
+                columns: cols.iter().map(|c| Column { id: c.parse().unwrap(), title: c.to_string() }).collect(),
+                cards: cards.iter().map(|(c, ts)| (
+                    c.parse().unwrap(),
+                    ts.iter().map(|t| t.parse().unwrap()).collect(),
+                )).collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn valid_board_parses() {
+        let b = Board::try_from(raw_board(&[("inbox", &["task-0001"]), ("doing", &[])], &["inbox", "doing"])).unwrap();
+        assert_eq!(b.columns().len(), 2);
+        assert_eq!(b.cards().get(&"inbox".parse().unwrap()).unwrap(), &vec![TaskId::new(1)]);
+    }
+
+    #[test]
+    fn card_in_unknown_column_is_rejected() {
+        let err = Board::try_from(raw_board(&[("ghost", &["task-0001"])], &["inbox"])).unwrap_err();
+        assert!(matches!(err, BoardError::UnknownColumn { .. }));
+    }
+
+    #[test]
+    fn task_in_two_columns_is_rejected() {
+        let raw = raw_board(&[("inbox", &["task-0001"]), ("doing", &["task-0001"])], &["inbox", "doing"]);
+        assert!(matches!(Board::try_from(raw).unwrap_err(), BoardError::DuplicateTask(_)));
+    }
+
+    #[test]
+    fn board_round_trips_through_yaml() {
+        let b = Board::try_from(raw_board(&[("inbox", &["task-0001"])], &["inbox"])).unwrap();
+        let y = serde_yml::to_string(&b).unwrap();
+        let b2: Board = serde_yml::from_str(&y).unwrap();
+        assert_eq!(b, b2);
     }
 }

@@ -190,9 +190,91 @@ impl From<Board> for RawBoard {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Task {
+    pub api_version: ApiVersion,
+    pub kind: TaskKind,
+    pub metadata: Metadata,
+    pub spec: TaskSpec,
+    #[serde(default)]
+    pub status: TaskStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSpec {
+    pub title: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    pub description_ref: String,
+    pub notes_ref: String,
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub jira: Jira,
+    #[serde(default)]
+    pub context: Context,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Jira {
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Context {
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskStatus {
+    #[serde(default)]
+    pub worker_session_ref: Option<String>,
+    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<OffsetDateTime>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_parses_and_defaults_status() {
+        let yaml = "\
+apiVersion: kanban.local/v1alpha1
+kind: Task
+metadata:
+  name: task-0001
+spec:
+  title: Build structured task format
+  summary: Define YAML-backed task resources.
+  color: blue
+  descriptionRef: description.md
+  notesRef: notes.md
+  acceptanceCriteria:
+    - Task metadata is machine-readable.
+  repo: ~/vcs/my-project
+  context:
+    include: [description.md, notes.md]
+    exclude: [../../secrets/]
+";
+        let t: Task = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(t.spec.title, "Build structured task format");
+        assert_eq!(t.spec.repo.as_deref(), Some("~/vcs/my-project"));
+        assert_eq!(t.spec.context.include.len(), 2);
+        assert_eq!(t.status.worker_session_ref, None);
+    }
 
     #[test]
     fn wrong_kind_fails_to_deserialize() {

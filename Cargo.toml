@@ -1,0 +1,22 @@
+[package]
+name = "kanban"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "kanban"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kanban"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yml = "0.0.12"
+time = { version = "0.3", features = ["serde-well-known", "macros", "parsing", "formatting"] }
+thiserror = "1"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"

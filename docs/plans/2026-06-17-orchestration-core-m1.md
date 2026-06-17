@@ -160,19 +160,19 @@ pub enum ApiVersion {
 }
 
 macro_rules! kind_tag {
-    ($name:ident => $lit:literal) => {
+    ($name:ident => $variant:ident => $lit:literal) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
         pub enum $name {
             #[default]
             #[serde(rename = $lit)]
-            $name,
+            $variant,
         }
     };
 }
-kind_tag!(BoardKind => "Board");
-kind_tag!(TaskKind => "Task");
-kind_tag!(WorkerSessionKind => "WorkerSession");
-kind_tag!(WorkerEventListKind => "WorkerEventList");
+kind_tag!(BoardKind => Board => "Board");
+kind_tag!(TaskKind => Task => "Task");
+kind_tag!(WorkerSessionKind => WorkerSession => "WorkerSession");
+kind_tag!(WorkerEventListKind => WorkerEventList => "WorkerEventList");
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

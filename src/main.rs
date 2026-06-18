@@ -21,6 +21,11 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:7777")]
         addr: SocketAddr,
     },
+    /// Launch the terminal UI (connects to a running daemon).
+    Tui {
+        #[arg(long, default_value = "http://127.0.0.1:7777")]
+        daemon: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -37,6 +42,10 @@ fn main() -> anyhow::Result<()> {
         Command::Daemon { addr } => {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
             rt.block_on(kanban::controller::server::serve(cli.root, addr))
+        }
+        Command::Tui { daemon } => {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+            rt.block_on(kanban::tui::run::run(daemon))
         }
     }
 }

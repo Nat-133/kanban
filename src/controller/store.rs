@@ -63,6 +63,82 @@ pub fn load_events(session_dir: &Path) -> anyhow::Result<Vec<WorkerEvent>> {
     Ok(list.items)
 }
 
+pub fn tasks_dir(root: &Path) -> PathBuf { root.join("tasks") }
+pub fn task_dir(root: &Path, id: TaskId) -> PathBuf { tasks_dir(root).join(id.to_string()) }
+fn task_file(root: &Path, id: TaskId) -> PathBuf { task_dir(root, id).join("task.yaml") }
+
+pub fn init_workspace(root: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(tasks_dir(root))?;
+    fs::create_dir_all(root.join("sessions"))?;
+    fs::create_dir_all(root.join("archive"))?;
+    if !board_path(root).exists() {
+        let board = Board::try_from(default_board())
+            .map_err(|e| anyhow::anyhow!("default board invalid: {e}"))?;
+        save_board(root, &board)?;
+    }
+    Ok(())
+}
+
+fn default_board() -> RawBoard {
+    let columns = ["inbox", "ready", "doing", "blocked", "waiting-human", "review", "done"];
+    RawBoard {
+        api_version: ApiVersion::V1Alpha1,
+        kind: BoardKind::Board,
+        metadata: Metadata { name: "default".into(), creation_timestamp: None, labels: Default::default() },
+        spec: RawBoardSpec {
+            columns: columns.iter().map(|c| Column {
+                id: c.parse().expect("static column id is valid"),
+                title: title_case(c),
+            }).collect(),
+            cards: columns.iter().map(|c| (c.parse().unwrap(), Vec::new())).collect(),
+        },
+    }
+}
+
+fn title_case(s: &str) -> String {
+    s.split('-').map(|w| {
+        let mut chars = w.chars();
+        match chars.next() {
+            Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+            None => String::new(),
+        }
+    }).collect::<Vec<_>>().join(" ")
+}
+
+pub fn load_task(root: &Path, id: TaskId) -> anyhow::Result<Task> {
+    let text = fs::read_to_string(task_file(root, id))?;
+    Ok(serde_yml::from_str(&text)?)
+}
+
+pub fn save_task(root: &Path, task: &Task) -> anyhow::Result<()> {
+    let id: TaskId = task.metadata.name.parse()
+        .map_err(|_| anyhow::anyhow!("task metadata.name is not a valid task id: {}", task.metadata.name))?;
+    let text = serde_yml::to_string(task)?;
+    atomic_write(&task_file(root, id), &text)
+}
+
+pub fn load_all_tasks(root: &Path) -> anyhow::Result<Vec<Task>> {
+    let mut out = Vec::new();
+    let dir = tasks_dir(root);
+    if dir.exists() {
+        for entry in fs::read_dir(&dir)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if let Ok(id) = name.parse::<TaskId>() {
+                out.push(load_task(root, id)?);
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn archive_task(root: &Path, id: TaskId) -> anyhow::Result<()> {
+    let from = task_dir(root, id);
+    let to = root.join("archive").join(id.to_string());
+    fs::create_dir_all(root.join("archive"))?;
+    fs::rename(from, to)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +219,62 @@ items:
             e[1].kind,
             WorkerEventKind::HumanInputRequired(Notification::IdlePrompt)
         );
+    }
+
+    #[test]
+    fn init_workspace_creates_layout_and_default_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        assert!(root.join("board.yaml").exists());
+        assert!(root.join("tasks").is_dir());
+        let board = load_board(&root).unwrap();
+        assert!(!board.columns().is_empty());
+    }
+
+    #[test]
+    fn task_saves_and_loads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        let task = sample_task(TaskId::new(1), "First");
+        save_task(&root, &task).unwrap();
+        assert_eq!(load_task(&root, TaskId::new(1)).unwrap(), task);
+    }
+
+    #[test]
+    fn load_all_tasks_returns_every_saved_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        save_task(&root, &sample_task(TaskId::new(1), "A")).unwrap();
+        save_task(&root, &sample_task(TaskId::new(2), "B")).unwrap();
+        let all = load_all_tasks(&root).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn archive_task_moves_dir_out_of_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        save_task(&root, &sample_task(TaskId::new(1), "A")).unwrap();
+        archive_task(&root, TaskId::new(1)).unwrap();
+        assert!(!root.join("tasks/task-0001").exists());
+        assert!(root.join("archive/task-0001").exists());
+    }
+
+    fn sample_task(id: TaskId, title: &str) -> Task {
+        Task {
+            api_version: ApiVersion::V1Alpha1,
+            kind: TaskKind::Task,
+            metadata: Metadata { name: id.to_string(), creation_timestamp: None, labels: Default::default() },
+            spec: TaskSpec {
+                title: title.into(), summary: String::new(), color: None,
+                description_ref: "description.md".into(), notes_ref: "notes.md".into(),
+                acceptance_criteria: vec![], repo: None, jira: Default::default(), context: Default::default(),
+            },
+            status: Default::default(),
+        }
     }
 }

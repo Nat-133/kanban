@@ -10,7 +10,9 @@ pub fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
         .parent()
         .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
     fs::create_dir_all(parent)?;
-    let tmp = path.with_extension("tmp");
+    let file_name = path.file_name()
+        .ok_or_else(|| anyhow::anyhow!("path has no file name: {}", path.display()))?;
+    let tmp = path.with_file_name(format!("{}.tmp", file_name.to_string_lossy()));
     {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(contents.as_bytes())?;
@@ -46,7 +48,9 @@ pub fn next_task_id(root: &Path) -> anyhow::Result<TaskId> {
             }
         }
     }
-    Ok(TaskId::new(max + 1))
+    max.checked_add(1)
+        .map(TaskId::new)
+        .ok_or_else(|| anyhow::anyhow!("task id space exhausted"))
 }
 
 pub fn load_events(session_dir: &Path) -> anyhow::Result<Vec<WorkerEvent>> {
@@ -70,6 +74,7 @@ mod tests {
         atomic_write(&path, "hello: world\n").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello: world\n");
         assert!(!dir.path().join("nested/board.tmp").exists());
+        assert!(!dir.path().join("nested/board.yaml.tmp").exists());
     }
 
     #[test]

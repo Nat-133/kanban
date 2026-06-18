@@ -92,7 +92,7 @@ impl fmt::Display for ColumnId {
 impl FromStr for ColumnId {
     type Err = IdError;
     fn from_str(s: &str) -> Result<Self, IdError> {
-        if s.is_empty() { return Err(IdError::EmptyColumn); }
+        if s.trim().is_empty() { return Err(IdError::EmptyColumn); }
         Ok(ColumnId(s.to_string()))
     }
 }
@@ -149,8 +149,8 @@ impl Board {
 pub enum BoardError {
     #[error("duplicate column id: {0}")]
     DuplicateColumn(ColumnId),
-    #[error("card {task} placed in unknown column {column}")]
-    UnknownColumn { task: TaskId, column: ColumnId },
+    #[error("a card is placed in unknown column {column}")]
+    UnknownColumn { task: Option<TaskId>, column: ColumnId },
     #[error("task {0} appears in more than one column")]
     DuplicateTask(TaskId),
 }
@@ -167,7 +167,7 @@ impl TryFrom<RawBoard> for Board {
         let mut seen = BTreeSet::new();
         for (column, tasks) in &raw.spec.cards {
             if !known.contains(column) {
-                let task = tasks.first().copied().unwrap_or(TaskId::new(0));
+                let task = tasks.first().copied();
                 return Err(BoardError::UnknownColumn { task, column: column.clone() });
             }
             for &t in tasks {
@@ -383,6 +383,10 @@ pub struct WorkerSessionStatus {
     pub transcript_ref: Option<String>,
 }
 
+/// Unlike other resources, the envelope fields (`apiVersion`/`kind`/`metadata`)
+/// are intentionally permissive here: the events file is loaded without requiring
+/// a `kind` tag, and the loader and tests construct it minimally (often with only
+/// `items`). This looseness is by design, not an oversight.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerEventList {
@@ -471,6 +475,7 @@ labels:
     fn column_id_rejects_empty() {
         assert!("inbox".parse::<ColumnId>().is_ok());
         assert!("".parse::<ColumnId>().is_err());
+        assert!(" ".parse::<ColumnId>().is_err());
     }
 
     fn raw_board(cards: &[(&str, &[&str])], cols: &[&str]) -> RawBoard {
@@ -504,6 +509,18 @@ labels:
     #[test]
     fn task_in_two_columns_is_rejected() {
         let raw = raw_board(&[("inbox", &["task-0001"]), ("doing", &["task-0001"])], &["inbox", "doing"]);
+        assert!(matches!(Board::try_from(raw).unwrap_err(), BoardError::DuplicateTask(_)));
+    }
+
+    #[test]
+    fn duplicate_column_is_rejected() {
+        let raw = raw_board(&[], &["inbox", "inbox"]);
+        assert!(matches!(Board::try_from(raw).unwrap_err(), BoardError::DuplicateColumn(_)));
+    }
+
+    #[test]
+    fn task_listed_twice_in_one_column_is_rejected() {
+        let raw = raw_board(&[("inbox", &["task-0001", "task-0001"])], &["inbox"]);
         assert!(matches!(Board::try_from(raw).unwrap_err(), BoardError::DuplicateTask(_)));
     }
 
@@ -577,5 +594,15 @@ status:
         let s: WorkerSession = serde_yml::from_str(yaml).unwrap();
         assert_eq!(s.spec.task_ref, TaskId::new(1));
         assert_eq!(s.status.transcript_ref.as_deref(), Some("transcript.jsonl"));
+    }
+
+    #[test]
+    fn worker_event_round_trips_through_yaml() {
+        let yaml = "type: human_input_required\nsource: claude-code-hook\nnotificationType: permission_prompt\nobservedAt: \"2026-06-17T10:30:00Z\"\npayloadRef: hooks/processed/e.json\n";
+        let e: WorkerEvent = serde_yml::from_str(yaml).unwrap();
+        let s = serde_yml::to_string(&e).unwrap();
+        let e2: WorkerEvent = serde_yml::from_str(&s).unwrap();
+        assert_eq!(e, e2);
+        assert_eq!(e.kind, WorkerEventKind::HumanInputRequired(Notification::PermissionPrompt));
     }
 }

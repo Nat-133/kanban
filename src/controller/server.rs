@@ -100,9 +100,8 @@ mod tests {
         let mut es = reqwest_eventsource::EventSource::get(format!("http://{addr}/v1/events"));
         // wait until the stream is open
         loop {
-            match es.next().await.unwrap().unwrap() {
-                reqwest_eventsource::Event::Open => break,
-                _ => {}
+            if let reqwest_eventsource::Event::Open = es.next().await.unwrap().unwrap() {
+                break;
             }
         }
         let client = reqwest::Client::new();

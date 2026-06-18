@@ -245,6 +245,101 @@ pub struct TaskStatus {
     pub updated_at: Option<OffsetDateTime>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerEventKind {
+    Started,
+    Working,
+    HumanInputRequired(Notification),
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Notification {
+    PermissionPrompt,
+    IdlePrompt,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawWorkerEvent", into = "RawWorkerEvent")]
+pub struct WorkerEvent {
+    pub kind: WorkerEventKind,
+    pub source: String,
+    #[allow(dead_code)]
+    pub observed_at: OffsetDateTime,
+    pub payload_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawEventType { Started, Working, HumanInputRequired, Completed, Failed }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawWorkerEvent {
+    #[serde(rename = "type")]
+    event_type: RawEventType,
+    source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notification_type: Option<Notification>,
+    #[serde(with = "time::serde::rfc3339")]
+    observed_at: OffsetDateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload_ref: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum EventError {
+    #[error("human_input_required event is missing notificationType")]
+    MissingNotification,
+    #[error("notificationType is only valid on human_input_required events")]
+    UnexpectedNotification,
+}
+
+impl TryFrom<RawWorkerEvent> for WorkerEvent {
+    type Error = EventError;
+    fn try_from(r: RawWorkerEvent) -> Result<Self, EventError> {
+        use RawEventType as T;
+        let kind = match (r.event_type, r.notification_type) {
+            (T::HumanInputRequired, Some(n)) => WorkerEventKind::HumanInputRequired(n),
+            (T::HumanInputRequired, None) => return Err(EventError::MissingNotification),
+            (_, Some(_)) => return Err(EventError::UnexpectedNotification),
+            (T::Started, None) => WorkerEventKind::Started,
+            (T::Working, None) => WorkerEventKind::Working,
+            (T::Completed, None) => WorkerEventKind::Completed,
+            (T::Failed, None) => WorkerEventKind::Failed,
+        };
+        Ok(WorkerEvent { kind, source: r.source, observed_at: r.observed_at, payload_ref: r.payload_ref })
+    }
+}
+
+impl From<WorkerEvent> for RawWorkerEvent {
+    fn from(e: WorkerEvent) -> RawWorkerEvent {
+        let (event_type, notification_type) = match e.kind {
+            WorkerEventKind::Started => (RawEventType::Started, None),
+            WorkerEventKind::Working => (RawEventType::Working, None),
+            WorkerEventKind::HumanInputRequired(n) => (RawEventType::HumanInputRequired, Some(n)),
+            WorkerEventKind::Completed => (RawEventType::Completed, None),
+            WorkerEventKind::Failed => (RawEventType::Failed, None),
+        };
+        RawWorkerEvent { event_type, source: e.source, notification_type, observed_at: e.observed_at, payload_ref: e.payload_ref }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerEventList {
+    #[serde(default)]
+    pub api_version: Option<ApiVersion>,
+    #[serde(default)]
+    pub kind: Option<WorkerEventListKind>,
+    #[serde(default)]
+    pub metadata: Option<Metadata>,
+    #[serde(default)]
+    pub items: Vec<WorkerEvent>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,5 +457,50 @@ labels:
         let y = serde_yml::to_string(&b).unwrap();
         let b2: Board = serde_yml::from_str(&y).unwrap();
         assert_eq!(b, b2);
+    }
+
+    #[test]
+    fn event_list_parses_sum_type() {
+        let yaml = "\
+apiVersion: kanban.local/v1alpha1
+kind: WorkerEventList
+metadata:
+  name: s
+items:
+  - type: started
+    source: controller
+    observedAt: \"2026-06-17T10:00:00Z\"
+  - type: human_input_required
+    source: claude-code-hook
+    notificationType: permission_prompt
+    observedAt: \"2026-06-17T10:30:00Z\"
+    payloadRef: hooks/processed/event-0002.json
+";
+        let list: WorkerEventList = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(list.items.len(), 2);
+        assert_eq!(list.items[0].kind, WorkerEventKind::Started);
+        assert_eq!(list.items[1].kind, WorkerEventKind::HumanInputRequired(Notification::PermissionPrompt));
+        assert_eq!(list.items[1].payload_ref.as_deref(), Some("hooks/processed/event-0002.json"));
+    }
+
+    #[test]
+    fn human_input_without_notification_is_rejected() {
+        let yaml = "\
+type: human_input_required
+source: x
+observedAt: \"2026-06-17T10:30:00Z\"
+";
+        assert!(serde_yml::from_str::<WorkerEvent>(yaml).is_err());
+    }
+
+    #[test]
+    fn non_notification_event_with_notification_is_rejected() {
+        let yaml = "\
+type: started
+source: x
+notificationType: idle_prompt
+observedAt: \"2026-06-17T10:30:00Z\"
+";
+        assert!(serde_yml::from_str::<WorkerEvent>(yaml).is_err());
     }
 }

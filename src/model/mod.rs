@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 use time::OffsetDateTime;
 
@@ -329,6 +330,43 @@ impl From<WorkerEvent> for RawWorkerEvent {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct WorkerSession {
+    pub api_version: ApiVersion,
+    pub kind: WorkerSessionKind,
+    pub metadata: Metadata,
+    pub spec: WorkerSessionSpec,
+    #[serde(default)]
+    pub status: WorkerSessionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerSessionSpec {
+    pub task_ref: TaskId,
+    pub worker: String,
+    pub workspace: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<PathBuf>,
+    #[serde(default)]
+    pub command: Vec<String>,
+}
+
+/// Only non-derived facts. Phase/needs_human_input are computed from events.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerSessionStatus {
+    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkerEventList {
     #[serde(default)]
     pub api_version: Option<ApiVersion>,
@@ -502,5 +540,24 @@ notificationType: idle_prompt
 observedAt: \"2026-06-17T10:30:00Z\"
 ";
         assert!(serde_yml::from_str::<WorkerEvent>(yaml).is_err());
+    }
+
+    #[test]
+    fn worker_session_round_trips() {
+        let yaml = "\
+apiVersion: kanban.local/v1alpha1
+kind: WorkerSession
+metadata:
+  name: task-0001-claude
+spec:
+  taskRef: task-0001
+  worker: claude
+  workspace: .kanban/sessions/task-0001
+status:
+  transcriptRef: transcript.jsonl
+";
+        let s: WorkerSession = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(s.spec.task_ref, TaskId::new(1));
+        assert_eq!(s.status.transcript_ref.as_deref(), Some("transcript.jsonl"));
     }
 }

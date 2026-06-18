@@ -1,5 +1,7 @@
 // types — Tasks 1–6
 
+pub mod proto;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;

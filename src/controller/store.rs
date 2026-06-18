@@ -49,6 +49,16 @@ pub fn next_task_id(root: &Path) -> anyhow::Result<TaskId> {
     Ok(TaskId::new(max + 1))
 }
 
+pub fn load_events(session_dir: &Path) -> anyhow::Result<Vec<WorkerEvent>> {
+    let path = session_dir.join("events.yaml");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(&path)?;
+    let list: WorkerEventList = serde_yml::from_str(&text)?;
+    Ok(list.items)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +112,31 @@ mod tests {
         fs::create_dir_all(tasks.join("task-0007")).unwrap();
         fs::create_dir_all(tasks.join("not-a-task")).unwrap();
         assert_eq!(next_task_id(dir.path()).unwrap(), TaskId::new(8));
+    }
+
+    #[test]
+    fn load_events_empty_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_events(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_events_parses_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "\
+metadata:
+  name: s
+items:
+  - {type: started, source: controller, observedAt: \"2026-06-17T10:00:00Z\"}
+  - {type: human_input_required, source: h, notificationType: idle_prompt, observedAt: \"2026-06-17T10:30:00Z\"}
+";
+        fs::write(dir.path().join("events.yaml"), yaml).unwrap();
+        let e = load_events(dir.path()).unwrap();
+        assert_eq!(e.len(), 2);
+        assert_eq!(e[0].kind, WorkerEventKind::Started);
+        assert_eq!(
+            e[1].kind,
+            WorkerEventKind::HumanInputRequired(Notification::IdlePrompt)
+        );
     }
 }

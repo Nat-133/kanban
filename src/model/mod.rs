@@ -262,6 +262,24 @@ pub enum Notification {
     IdlePrompt,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Phase {
+    Pending,
+    Working,
+    WaitingHuman,
+    Idle,
+    Completed,
+    Failed,
+}
+
+impl Phase {
+    /// Derived, not stored: true exactly when the worker is blocked on a human.
+    pub fn needs_human_input(&self) -> bool {
+        matches!(self, Phase::WaitingHuman | Phase::Idle)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "RawWorkerEvent", into = "RawWorkerEvent")]
 pub struct WorkerEvent {

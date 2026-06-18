@@ -124,6 +124,8 @@ pub struct RawBoard {
     pub kind: BoardKind,
     pub metadata: Metadata,
     pub spec: RawBoardSpec,
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, serde_yml::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -189,6 +191,7 @@ impl From<Board> for RawBoard {
             kind: BoardKind::Board,
             metadata: b.metadata,
             spec: RawBoardSpec { columns: b.columns, cards: b.cards },
+            unknown: Default::default(),
         }
     }
 }
@@ -492,6 +495,7 @@ labels:
                     ts.iter().map(|t| t.parse().unwrap()).collect(),
                 )).collect(),
             },
+            unknown: Default::default(),
         }
     }
 

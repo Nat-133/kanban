@@ -31,6 +31,16 @@ pub fn load_board(root: &Path) -> anyhow::Result<Board> {
     Ok(serde_yml::from_str(&text)?)
 }
 
+pub fn load_board_checked(root: &Path) -> anyhow::Result<Board> {
+    let text = fs::read_to_string(board_path(root))?;
+    let raw: RawBoard = serde_yml::from_str(&text)?;
+    if !raw.unknown.is_empty() {
+        let keys: Vec<_> = raw.unknown.keys().cloned().collect();
+        tracing::warn!(file = %board_path(root).display(), ?keys, "ignoring unknown field(s) in board.yaml");
+    }
+    Ok(Board::try_from(raw)?)
+}
+
 pub fn save_board(root: &Path, board: &Board) -> anyhow::Result<()> {
     let text = serde_yml::to_string(board)?;
     atomic_write(&board_path(root), &text)
@@ -92,6 +102,7 @@ fn default_board() -> RawBoard {
             }).collect(),
             cards: columns.iter().map(|c| (c.parse().unwrap(), Vec::new())).collect(),
         },
+        unknown: Default::default(),
     }
 }
 
@@ -173,10 +184,24 @@ mod tests {
                     .into_iter()
                     .collect(),
             },
+            unknown: Default::default(),
         };
         let board = Board::try_from(raw).unwrap();
         save_board(dir.path(), &board).unwrap();
         assert_eq!(load_board(dir.path()).unwrap(), board);
+    }
+
+    #[test]
+    fn load_board_warns_but_succeeds_on_unknown_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        let mut text = fs::read_to_string(board_path(&root)).unwrap();
+        text.push_str("bogusField: 99\n");
+        fs::write(board_path(&root), text).unwrap();
+        // still loads (permissive); unknown field captured, not fatal
+        let board = load_board_checked(&root).unwrap();
+        assert!(!board.columns().is_empty());
     }
 
     #[test]

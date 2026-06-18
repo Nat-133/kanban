@@ -23,6 +23,7 @@
 
 - **M1 — Core model:** types, store, derivation. *(this plan)*
 - **M2 — Daemon skeleton:** UDS server, `proto` intent/response types, board/task CRUD, `clap` dispatch.
+  - *Deferred from M1 review:* permissive parsing is kept (no `deny_unknown_fields`), but the store load boundary should **warn on unknown YAML fields** — capture them via a flattened catch-all `BTreeMap<String, serde_yml::Value>` on the `Raw*` types, load through the `Raw*` type so unknowns are inspectable, and emit a warning via the M2 logger (don't log from the pure `model` layer). This surfaces typos (a misspelled field silently parses as missing today) without rejecting forward-compatible extra fields.
 - **M3 — TUI:** ratatui board, navigation, intents over the socket, live push.
 - **M4 — Worker handoff:** tmux adapter, session workspace + allowlist symlinks + base-dir grants.
 - **M5 — Hooks & events:** `kanban hook`, intake-spool draining, event ingestion, derived state → card transitions.

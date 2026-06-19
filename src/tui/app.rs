@@ -149,6 +149,12 @@ impl App {
                 Some(t) => Action::Send(Intent::ArchiveTask { task: t }),
                 None => Action::None,
             },
+            KeyCode::Char('c') => {
+                if let Some(t) = self.selected_task() {
+                    return Action::Send(Intent::Handoff { task: t, worker: "claude".into() });
+                }
+                Action::None
+            }
             KeyCode::Char('a') => {
                 self.mode = Mode::AddTask;
                 self.input.clear();
@@ -290,6 +296,13 @@ mod tests {
     fn d_emits_archive_intent() {
         let mut app = App::new(snap());
         assert_eq!(app.on_key(key('d')), Action::Send(Intent::ArchiveTask { task: TaskId::new(1) }));
+    }
+
+    #[test]
+    fn c_emits_handoff_intent() {
+        let mut app = App::new(snap());
+        let action = app.on_key(key('c'));
+        assert_eq!(action, Action::Send(Intent::Handoff { task: TaskId::new(1), worker: "claude".into() }));
     }
 
     #[test]

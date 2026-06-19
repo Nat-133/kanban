@@ -60,7 +60,7 @@ pub fn render(f: &mut Frame, app: &App) {
     }
 
     let footer = Paragraph::new(
-        "h/l/j/k move · H/L move card · J/K reorder · a add · d archive · ? help · q quit",
+        "h/l/j/k move · H/L move card · J/K reorder · a add · c hand off · d archive · ? help · q quit",
     )
     .style(Style::default().fg(Color::DarkGray));
     f.render_widget(footer, footer_area);
@@ -85,6 +85,7 @@ pub fn render(f: &mut Frame, app: &App) {
                 "  H / L        move card to prev / next column",
                 "  J / K        reorder card down / up",
                 "  a            add task",
+                "  c            hand off selected task",
                 "  d            archive selected task",
                 "  ?            toggle this help",
                 "  q            quit",

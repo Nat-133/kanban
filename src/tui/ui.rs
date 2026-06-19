@@ -41,7 +41,7 @@ pub fn render(f: &mut Frame, app: &App) {
                 .title(column.title.clone());
 
             let items: Vec<ListItem> = app
-                .column_cards(i)
+                .visible_cards(i)
                 .iter()
                 .enumerate()
                 .map(|(row, task)| {
@@ -67,10 +67,14 @@ pub fn render(f: &mut Frame, app: &App) {
         }
     }
 
-    let footer = Paragraph::new(
-        "h/l/j/k move · H/L move card · J/K reorder · a add · c hand off · d archive · ? help · q quit",
-    )
-    .style(Style::default().fg(Color::DarkGray));
+    let footer = if matches!(app.mode(), Mode::Search) || !app.filter().is_empty() {
+        Paragraph::new(format!("/{}", app.filter())).style(Style::default().fg(Color::Yellow))
+    } else {
+        Paragraph::new(
+            "h/l/j/k move · H/L move card · J/K reorder · a add · e edit · / search · c hand off · d archive · ? help · q quit",
+        )
+        .style(Style::default().fg(Color::DarkGray))
+    };
     f.render_widget(footer, footer_area);
 
     match app.mode() {
@@ -82,6 +86,17 @@ pub fn render(f: &mut Frame, app: &App) {
                 .border_style(Style::default().fg(Color::Yellow));
             let para =
                 Paragraph::new(format!("New task: {}", app.input())).block(block);
+            f.render_widget(Clear, area);
+            f.render_widget(para, area);
+        }
+        Mode::EditTask => {
+            let area = centered_rect(60, 3, f.area());
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title("Edit task")
+                .border_style(Style::default().fg(Color::Yellow));
+            let para =
+                Paragraph::new(format!("Edit title: {}", app.input())).block(block);
             f.render_widget(Clear, area);
             f.render_widget(para, area);
         }
@@ -110,7 +125,7 @@ pub fn render(f: &mut Frame, app: &App) {
             f.render_widget(Clear, area);
             f.render_widget(para, area);
         }
-        Mode::Normal => {}
+        Mode::Normal | Mode::Search => {}
     }
 }
 

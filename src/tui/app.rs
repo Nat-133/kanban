@@ -1,7 +1,7 @@
 // app state + key handling — Task 3
 
 use crate::model::proto::Intent;
-use crate::model::{Column, ColumnId, TaskId};
+use crate::model::{Column, ColumnId, Task, TaskId};
 use crate::tui::client::Snapshot;
 use crossterm::event::{KeyCode, KeyEvent};
 
@@ -22,6 +22,7 @@ pub enum Mode {
     EditTask,
     Search,
     Help,
+    Detail,
 }
 
 /// Pure TUI state: holds the latest snapshot, the cursor (column/row), the
@@ -131,6 +132,13 @@ impl App {
         self.visible_cards(self.col).get(self.row).copied()
     }
 
+    /// The currently selected task's full record, looked up from the snapshot.
+    pub fn detail_task(&self) -> Option<&Task> {
+        let id = self.selected_task()?;
+        let name = id.to_string();
+        self.snapshot.tasks.iter().find(|t| t.metadata.name == name)
+    }
+
     fn clamp(&mut self) {
         let ncols = self.columns().len();
         if ncols == 0 {
@@ -149,11 +157,22 @@ impl App {
             Mode::AddTask => self.on_add(key),
             Mode::EditTask => self.on_edit(key),
             Mode::Search => self.on_search(key),
+            Mode::Detail => self.on_detail(key),
             Mode::Help => {
                 self.mode = Mode::Normal;
                 Action::None
             }
         }
+    }
+
+    fn on_detail(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                self.mode = Mode::Normal;
+            }
+            _ => {}
+        }
+        Action::None
     }
 
     fn on_normal(&mut self, key: KeyEvent) -> Action {
@@ -225,6 +244,12 @@ impl App {
             }
             KeyCode::Char('?') => {
                 self.mode = Mode::Help;
+                Action::None
+            }
+            KeyCode::Enter => {
+                if self.selected_task().is_some() {
+                    self.mode = Mode::Detail;
+                }
                 Action::None
             }
             _ => Action::None,
@@ -511,5 +536,14 @@ mod tests {
     fn empty_filter_shows_all_cards() {
         let app = App::new(snap());
         assert_eq!(app.visible_cards(0), app.column_cards(0)); // no filter == all
+    }
+
+    #[test]
+    fn enter_opens_detail_then_closes() {
+        let mut app = App::new(snap());
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode(), Mode::Detail));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode(), Mode::Normal));
     }
 }

@@ -19,6 +19,8 @@ pub enum Action {
 pub enum Mode {
     Normal,
     AddTask,
+    EditTask,
+    Search,
     Help,
 }
 
@@ -30,6 +32,8 @@ pub struct App {
     row: usize,
     mode: Mode,
     input: String,
+    filter: String,
+    editing: Option<TaskId>,
     pub status: Option<String>,
 }
 
@@ -41,6 +45,8 @@ impl App {
             row: 0,
             mode: Mode::Normal,
             input: String::new(),
+            filter: String::new(),
+            editing: None,
             status: None,
         }
     }
@@ -89,8 +95,40 @@ impl App {
         self.snapshot().sessions.iter().find(|s| s.task == task)
     }
 
+    /// The current filter text (active when in `Search` mode or non-empty).
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// Look up a task's title from the snapshot by its id.
+    fn task_title(&self, id: TaskId) -> Option<String> {
+        let name = id.to_string();
+        self.snapshot
+            .tasks
+            .iter()
+            .find(|t| t.metadata.name == name)
+            .map(|t| t.spec.title.clone())
+    }
+
+    /// Cards in a column after applying the case-insensitive title filter.
+    /// An empty filter returns every card (identical to `column_cards`).
+    pub fn visible_cards(&self, col: usize) -> Vec<TaskId> {
+        let all = self.column_cards(col);
+        if self.filter.is_empty() {
+            return all;
+        }
+        let needle = self.filter.to_lowercase();
+        all.into_iter()
+            .filter(|t| {
+                self.task_title(*t)
+                    .map(|title| title.to_lowercase().contains(&needle))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
     pub fn selected_task(&self) -> Option<TaskId> {
-        self.column_cards(self.col).get(self.row).copied()
+        self.visible_cards(self.col).get(self.row).copied()
     }
 
     fn clamp(&mut self) {
@@ -101,7 +139,7 @@ impl App {
             return;
         }
         self.col = self.col.min(ncols - 1);
-        let n = self.column_cards(self.col).len();
+        let n = self.visible_cards(self.col).len();
         self.row = if n == 0 { 0 } else { self.row.min(n - 1) };
     }
 
@@ -109,6 +147,8 @@ impl App {
         match self.mode {
             Mode::Normal => self.on_normal(key),
             Mode::AddTask => self.on_add(key),
+            Mode::EditTask => self.on_edit(key),
+            Mode::Search => self.on_search(key),
             Mode::Help => {
                 self.mode = Mode::Normal;
                 Action::None
@@ -134,7 +174,7 @@ impl App {
                 Action::None
             }
             KeyCode::Char('j') => {
-                let n = self.column_cards(self.col).len();
+                let n = self.visible_cards(self.col).len();
                 if n > 0 && self.row + 1 < n {
                     self.row += 1;
                 }
@@ -171,6 +211,18 @@ impl App {
                 self.input.clear();
                 Action::None
             }
+            KeyCode::Char('e') => {
+                if let Some(t) = self.selected_task() {
+                    self.mode = Mode::EditTask;
+                    self.editing = Some(t);
+                    self.input = self.task_title(t).unwrap_or_default();
+                }
+                Action::None
+            }
+            KeyCode::Char('/') => {
+                self.mode = Mode::Search;
+                Action::None
+            }
             KeyCode::Char('?') => {
                 self.mode = Mode::Help;
                 Action::None
@@ -197,7 +249,7 @@ impl App {
 
     fn reorder(&self, dir: isize) -> Action {
         let new = self.row as isize + dir;
-        let n = self.column_cards(self.col).len() as isize;
+        let n = self.visible_cards(self.col).len() as isize;
         if new < 0 || new >= n {
             return Action::None;
         }
@@ -236,6 +288,69 @@ impl App {
             }
             KeyCode::Char(c) => {
                 self.input.push(c);
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    fn on_edit(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.editing = None;
+                self.input.clear();
+                Action::None
+            }
+            KeyCode::Enter => {
+                let title = std::mem::take(&mut self.input);
+                let task = self.editing.take();
+                self.mode = Mode::Normal;
+                if title.is_empty() {
+                    return Action::None;
+                }
+                match task {
+                    Some(task) => Action::Send(Intent::EditTask {
+                        task,
+                        title: Some(title),
+                        summary: None,
+                    }),
+                    None => Action::None,
+                }
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+                Action::None
+            }
+            KeyCode::Char(c) => {
+                self.input.push(c);
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    fn on_search(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.filter.clear();
+                self.clamp();
+                Action::None
+            }
+            KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                self.clamp();
+                Action::None
+            }
+            KeyCode::Backspace => {
+                self.filter.pop();
+                self.clamp();
+                Action::None
+            }
+            KeyCode::Char(c) => {
+                self.filter.push(c);
+                self.clamp();
                 Action::None
             }
             _ => Action::None,
@@ -368,5 +483,33 @@ mod tests {
         let action = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(action, Action::None);
         assert!(matches!(app.mode(), Mode::Normal));
+    }
+
+    #[test]
+    fn e_edits_selected_task_title() {
+        let mut app = App::new(snap()); // task-0001 title "First" selected
+        app.on_key(key('e'));
+        assert!(matches!(app.mode(), Mode::EditTask));
+        // modal pre-filled with current title -> backspace it out, type "New"
+        for _ in 0.."First".len() { app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)); }
+        app.on_key(key('N')); app.on_key(key('e')); app.on_key(key('w'));
+        let action = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(action, Action::Send(Intent::EditTask { task: TaskId::new(1), title: Some("New".into()), summary: None }));
+        assert!(matches!(app.mode(), Mode::Normal));
+    }
+
+    #[test]
+    fn slash_filters_cards_by_title() {
+        let mut app = App::new(snap()); // inbox: "First"(1), "Second"(2)
+        app.on_key(key('/'));
+        assert!(matches!(app.mode(), Mode::Search));
+        app.on_key(key('S')); app.on_key(key('e'));
+        assert_eq!(app.visible_cards(0), vec![TaskId::new(2)]); // col 0 = inbox; only "Second" matches "Se"
+    }
+
+    #[test]
+    fn empty_filter_shows_all_cards() {
+        let app = App::new(snap());
+        assert_eq!(app.visible_cards(0), app.column_cards(0)); // no filter == all
     }
 }

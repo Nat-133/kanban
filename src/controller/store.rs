@@ -26,6 +26,19 @@ pub fn board_path(root: &Path) -> PathBuf {
     root.join("board.yaml")
 }
 
+pub fn config_path(root: &Path) -> PathBuf {
+    root.join("config.yaml")
+}
+
+pub fn load_config(root: &Path) -> anyhow::Result<Config> {
+    let text = fs::read_to_string(config_path(root))?;
+    Ok(serde_yml::from_str(&text)?)
+}
+
+fn default_config_yaml() -> &'static str {
+    "agents:\n  baseDirs:\n    - ~/vcs/*\nworkers:\n  claude:\n    command: claude\n    args:\n      - --add-dir\n      - .kanban/sessions/{task_id}\n    workdir: \"{repo}\"\n    terminal:\n      type: tmux\n      sessionName: kanban-{task_id}\n"
+}
+
 pub fn load_board(root: &Path) -> anyhow::Result<Board> {
     let text = fs::read_to_string(board_path(root))?;
     Ok(serde_yml::from_str(&text)?)
@@ -85,6 +98,9 @@ pub fn init_workspace(root: &Path) -> anyhow::Result<()> {
         let board = Board::try_from(default_board())
             .map_err(|e| anyhow::anyhow!("default board invalid: {e}"))?;
         save_board(root, &board)?;
+    }
+    if !config_path(root).exists() {
+        atomic_write(&config_path(root), default_config_yaml())?;
     }
     Ok(())
 }
@@ -287,6 +303,15 @@ items:
         archive_task(&root, TaskId::new(1)).unwrap();
         assert!(!root.join("tasks/task-0001").exists());
         assert!(root.join("archive/task-0001").exists());
+    }
+
+    #[test]
+    fn init_writes_loadable_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        let cfg = load_config(&root).unwrap();
+        assert!(cfg.workers.contains_key("claude"));
     }
 
     fn sample_task(id: TaskId, title: &str) -> Task {

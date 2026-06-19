@@ -405,6 +405,41 @@ pub struct WorkerEventList {
     pub items: Vec<WorkerEvent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Config {
+    #[serde(default)]
+    pub agents: AgentConfig,
+    #[serde(default)]
+    pub workers: BTreeMap<String, WorkerConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentConfig {
+    #[serde(default)]
+    pub base_dirs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    pub terminal: TerminalConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalConfig {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub session_name: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,6 +635,28 @@ status:
         let s: WorkerSession = serde_yml::from_str(yaml).unwrap();
         assert_eq!(s.spec.task_ref, TaskId::new(1));
         assert_eq!(s.status.transcript_ref.as_deref(), Some("transcript.jsonl"));
+    }
+
+    #[test]
+    fn config_parses() {
+        let yaml = "\
+agents:
+  baseDirs:
+    - ~/vcs/*
+workers:
+  claude:
+    command: claude
+    args: [\"--add-dir\", \".kanban/sessions/{task_id}\"]
+    workdir: \"{repo}\"
+    terminal:
+      type: tmux
+      sessionName: kanban-{task_id}
+";
+        let cfg: Config = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(cfg.agents.base_dirs, vec!["~/vcs/*".to_string()]);
+        let w = cfg.workers.get("claude").unwrap();
+        assert_eq!(w.command, "claude");
+        assert_eq!(w.terminal.session_name, "kanban-{task_id}");
     }
 
     #[test]

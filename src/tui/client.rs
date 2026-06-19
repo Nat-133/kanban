@@ -31,7 +31,7 @@ impl Client {
 
     pub async fn snapshot(&self) -> anyhow::Result<Snapshot> {
         match self.send(Intent::GetBoard).await? {
-            Response::Snapshot { board, tasks } => Ok(Snapshot { board, tasks }),
+            Response::Snapshot { board, tasks, .. } => Ok(Snapshot { board, tasks }),
             Response::Error { message } => Err(anyhow::anyhow!(message)),
             Response::Ok { .. } => Err(anyhow::anyhow!("unexpected Ok response to GetBoard")),
         }

@@ -1,6 +1,6 @@
 // proto wire types — Task 1
 
-use crate::model::{Board, ColumnId, Task, TaskId};
+use crate::model::{Board, ColumnId, Phase, Task, TaskId};
 use serde::{Deserialize, Serialize};
 
 /// Requests a client sends to the controller. Internally tagged on `type`
@@ -23,10 +23,20 @@ pub enum Intent {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Response {
     /// Full board snapshot: the board plus every live (non-archived) task.
-    Snapshot { board: Board, tasks: Vec<Task> },
+    Snapshot { board: Board, tasks: Vec<Task>, sessions: Vec<SessionView> },
     /// A mutation succeeded; carries the affected task id when relevant.
     Ok { task: Option<TaskId> },
     Error { message: String },
+}
+
+/// A worker session as surfaced in a board snapshot: identity plus derived phase.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionView {
+    pub task: TaskId,
+    pub session_name: String,
+    pub phase: Phase,
+    pub needs_human_input: bool,
 }
 
 #[cfg(test)]
@@ -54,6 +64,13 @@ mod tests {
         let i = Intent::Handoff { task: TaskId::new(1), worker: "claude".into() };
         let back: Intent = serde_json::from_str(&serde_json::to_string(&i).unwrap()).unwrap();
         assert_eq!(i, back);
+    }
+
+    #[test]
+    fn session_view_round_trips() {
+        let sv = SessionView { task: TaskId::new(1), session_name: "kanban-task-0001".into(), phase: crate::model::Phase::WaitingHuman, needs_human_input: true };
+        let back: SessionView = serde_json::from_str(&serde_json::to_string(&sv).unwrap()).unwrap();
+        assert_eq!(sv, back);
     }
 
     #[test]

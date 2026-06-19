@@ -140,6 +140,20 @@ pub fn save_session(root: &Path, session: &WorkerSession) -> anyhow::Result<()> 
     atomic_write(&session_dir(root, id).join("session.yaml"), &text)
 }
 
+pub fn load_all_sessions(root: &Path) -> anyhow::Result<Vec<WorkerSession>> {
+    let mut out = Vec::new();
+    let dir = root.join("sessions");
+    if dir.exists() {
+        for e in fs::read_dir(&dir)? {
+            let p = e?.path().join("session.yaml");
+            if p.exists() {
+                out.push(serde_yml::from_str(&fs::read_to_string(&p)?)?);
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn load_task(root: &Path, id: TaskId) -> anyhow::Result<Task> {
     let text = fs::read_to_string(task_file(root, id))?;
     Ok(serde_yml::from_str(&text)?)

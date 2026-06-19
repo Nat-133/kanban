@@ -20,7 +20,17 @@ pub fn apply(root: &Path, intent: Intent) -> anyhow::Result<Response> {
         Intent::GetBoard => {
             let board = store::load_board_checked(root)?;
             let tasks = store::load_all_tasks(root)?;
-            Ok(Response::Snapshot { board, tasks })
+            let mut sessions = Vec::new();
+            for s in store::load_all_sessions(root)? {
+                let phase = crate::controller::derive::derive(&store::load_events(&store::session_dir(root, s.spec.task_ref))?);
+                sessions.push(crate::model::proto::SessionView {
+                    task: s.spec.task_ref,
+                    session_name: s.spec.session_name.clone().unwrap_or_default(),
+                    phase,
+                    needs_human_input: phase.needs_human_input(),
+                });
+            }
+            Ok(Response::Snapshot { board, tasks, sessions })
         }
         Intent::CreateTask { title, summary, column } => create_task(root, title, summary, column),
         Intent::EditTask { task, title, summary } => edit_task(root, task, title, summary),
@@ -184,6 +194,29 @@ mod tests {
         apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("inbox") }).unwrap();
         match apply(&r, Intent::GetBoard).unwrap() {
             Response::Snapshot { tasks, .. } => assert_eq!(tasks.len(), 1),
+            o => panic!("expected snapshot, got {o:?}"),
+        }
+    }
+
+    struct NoLaunch;
+    impl crate::controller::handoff::Launcher for NoLaunch {
+        fn launch(&self, _s: &crate::model::WorkerSession, _n: &str) -> anyhow::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn get_board_includes_sessions_with_phase() {
+        let dir = setup(); let r = root(&dir);
+        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("inbox") }).unwrap();
+        crate::controller::handoff::handoff(&r, TaskId::new(1), "claude", &NoLaunch).unwrap();
+        crate::controller::events::record_intake(&r, TaskId::new(1), "notification", "{\"notification_type\":\"permission_prompt\"}").unwrap();
+        crate::controller::events::ingest_session(&r, TaskId::new(1)).unwrap();
+        match apply(&r, Intent::GetBoard).unwrap() {
+            Response::Snapshot { sessions, .. } => {
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0].task, TaskId::new(1));
+                assert!(sessions[0].needs_human_input);
+                assert_eq!(sessions[0].session_name, "kanban-task-0001");
+            }
             o => panic!("expected snapshot, got {o:?}"),
         }
     }

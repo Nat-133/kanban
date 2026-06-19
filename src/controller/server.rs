@@ -16,12 +16,11 @@ struct AppState {
     changes: broadcast::Sender<()>,
 }
 
-pub fn router(root: PathBuf) -> Router {
-    let (tx, _rx) = broadcast::channel(64);
+pub fn router(root: PathBuf, changes: broadcast::Sender<()>) -> Router {
     Router::new()
         .route("/v1/intent", post(handle_intent))
         .route("/v1/events", get(sse_events))
-        .with_state(AppState { root: Arc::new(root), changes: tx })
+        .with_state(AppState { root: Arc::new(root), changes })
 }
 
 async fn handle_intent(State(state): State<AppState>, Json(intent): Json<Intent>) -> Json<Response> {
@@ -52,9 +51,28 @@ async fn sse_events(
 
 /// Bind and serve until the process is stopped. Used by `kanban daemon`.
 pub async fn serve(root: PathBuf, addr: std::net::SocketAddr) -> anyhow::Result<()> {
+    let (tx, _rx) = broadcast::channel(64);
+    // periodic reconcile: drain intake spools; notify subscribers on change
+    {
+        let root = root.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                tick.tick().await;
+                let r = root.clone();
+                if let Ok(Ok(true)) =
+                    tokio::task::spawn_blocking(move || crate::controller::events::reconcile_all(&r))
+                        .await
+                {
+                    let _ = tx.send(());
+                }
+            }
+        });
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "controller listening");
-    axum::serve(listener, router(root)).await?;
+    axum::serve(listener, router(root, tx)).await?;
     Ok(())
 }
 
@@ -72,7 +90,7 @@ mod tests {
         // bind :0 for an ephemeral port, serve in the background
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = router(root.clone());
+        let app = router(root.clone(), tokio::sync::broadcast::channel(64).0);
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
 
         let client = reqwest::Client::new();
@@ -95,7 +113,7 @@ mod tests {
         crate::controller::store::init_workspace(&root).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, router(root)).await.unwrap(); });
+        tokio::spawn(async move { axum::serve(listener, router(root, tokio::sync::broadcast::channel(64).0)).await.unwrap(); });
 
         let mut es = reqwest_eventsource::EventSource::get(format!("http://{addr}/v1/events"));
         // wait until the stream is open

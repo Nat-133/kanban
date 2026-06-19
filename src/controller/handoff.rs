@@ -5,6 +5,31 @@ use crate::model::{
 };
 use std::path::{Path, PathBuf};
 
+/// Launches a prepared worker session in a terminal/multiplexer.
+pub trait Launcher {
+    /// `session_name` is the resolved terminal session name (e.g. the tmux session).
+    fn launch(&self, session: &WorkerSession, session_name: &str) -> anyhow::Result<()>;
+}
+
+/// Real launcher: starts a detached tmux session running the worker command.
+pub struct TmuxLauncher;
+
+impl Launcher for TmuxLauncher {
+    fn launch(&self, session: &WorkerSession, session_name: &str) -> anyhow::Result<()> {
+        let mut cmd = std::process::Command::new("tmux");
+        cmd.arg("new-session").arg("-d").arg("-s").arg(session_name);
+        if let Some(workdir) = &session.spec.workdir {
+            cmd.arg("-c").arg(workdir);
+        }
+        cmd.args(&session.spec.command);
+        let status = cmd.status()?;
+        if !status.success() {
+            anyhow::bail!("tmux new-session failed with status {status}");
+        }
+        Ok(())
+    }
+}
+
 /// Prepare the per-task worker session workspace and build the `WorkerSession` value.
 ///
 /// Pure filesystem prep: creates the session directory and hook subdirectories,
@@ -201,6 +226,37 @@ mod tests {
         assert!(session.spec.command.iter().any(|a| a.contains(&format!("sessions/{id}"))));
         assert_eq!(session.spec.task_ref, id);
         assert_eq!(session.metadata.name, format!("{id}-claude"));
+    }
+
+    #[derive(Default)]
+    struct FakeLauncher {
+        launched: std::sync::Mutex<Vec<(crate::model::WorkerSession, String)>>,
+    }
+    impl super::Launcher for FakeLauncher {
+        fn launch(&self, session: &crate::model::WorkerSession, session_name: &str) -> anyhow::Result<()> {
+            self.launched.lock().unwrap().push((session.clone(), session_name.to_string()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fake_launcher_records_launch() {
+        use crate::model::*;
+        let session = WorkerSession {
+            api_version: ApiVersion::V1Alpha1, kind: WorkerSessionKind::WorkerSession,
+            metadata: Metadata { name: "task-0001-claude".into(), creation_timestamp: None, labels: Default::default() },
+            spec: WorkerSessionSpec {
+                task_ref: TaskId::new(1), worker: "claude".into(),
+                workspace: "/tmp/x".into(), workdir: None,
+                command: vec!["sleep".into(), "1".into()],
+            },
+            status: Default::default(),
+        };
+        let fake = FakeLauncher::default();
+        fake.launch(&session, "kanban-task-0001").unwrap();
+        let launched = fake.launched.lock().unwrap();
+        assert_eq!(launched.len(), 1);
+        assert_eq!(launched[0].1, "kanban-task-0001");
     }
 
     fn sample_task(id: crate::model::TaskId, title: &str) -> crate::model::Task {

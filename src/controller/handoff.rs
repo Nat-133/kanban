@@ -135,6 +135,7 @@ pub fn prepare_session(
             workspace: sdir,
             workdir: Some(workdir),
             command,
+            session_name: Some(substitute(&worker.terminal.session_name, &id.to_string(), task.spec.repo.as_deref())),
         },
         status: Default::default(),
     })
@@ -351,6 +352,7 @@ mod tests {
                 task_ref: TaskId::new(1), worker: "claude".into(),
                 workspace: "/tmp/x".into(), workdir: None,
                 command: vec!["sleep".into(), "1".into()],
+                session_name: None,
             },
             status: Default::default(),
         };

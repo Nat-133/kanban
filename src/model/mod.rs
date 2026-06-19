@@ -372,6 +372,8 @@ pub struct WorkerSessionSpec {
     pub workdir: Option<PathBuf>,
     #[serde(default)]
     pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
 }
 
 /// Only non-derived facts. Phase/needs_human_input are computed from events.

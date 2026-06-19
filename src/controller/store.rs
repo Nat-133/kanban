@@ -174,6 +174,40 @@ pub fn archive_task(root: &Path, id: TaskId) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn events_path(root: &Path, id: TaskId) -> PathBuf { session_dir(root, id).join("events.yaml") }
+
+pub fn append_worker_event(root: &Path, id: TaskId, event: &WorkerEvent) -> anyhow::Result<()> {
+    let mut items = load_events(&session_dir(root, id)).unwrap_or_default();
+    items.push(event.clone());
+    let list = WorkerEventList {
+        api_version: Some(ApiVersion::V1Alpha1),
+        kind: Some(WorkerEventListKind::WorkerEventList),
+        metadata: Some(Metadata { name: format!("{id}-events"), creation_timestamp: None, labels: Default::default() }),
+        items,
+    };
+    atomic_write(&events_path(root, id), &serde_yml::to_string(&list)?)
+}
+
+/// Intake payload files for a session, sorted by name (ingest order).
+pub fn list_intake(root: &Path, id: TaskId) -> anyhow::Result<Vec<PathBuf>> {
+    let dir = session_dir(root, id).join("hooks/intake");
+    let mut out = Vec::new();
+    if dir.exists() {
+        for e in fs::read_dir(&dir)? { out.push(e?.path()); }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Move a processed intake file into hooks/processed/ (once-only via rename).
+pub fn mark_processed(root: &Path, id: TaskId, path: &Path) -> anyhow::Result<()> {
+    let processed = session_dir(root, id).join("hooks/processed");
+    fs::create_dir_all(&processed)?;
+    let name = path.file_name().ok_or_else(|| anyhow::anyhow!("intake path has no file name"))?;
+    fs::rename(path, processed.join(name))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +354,36 @@ items:
         init_workspace(&root).unwrap();
         let cfg = load_config(&root).unwrap();
         assert!(cfg.workers.contains_key("claude"));
+    }
+
+    #[test]
+    fn append_worker_event_accumulates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        let id = TaskId::new(1);
+        std::fs::create_dir_all(session_dir(&root, id)).unwrap();
+        let ev = WorkerEvent { kind: WorkerEventKind::Started, source: "controller".into(),
+            observed_at: time::OffsetDateTime::UNIX_EPOCH, payload_ref: None };
+        append_worker_event(&root, id, &ev).unwrap();
+        append_worker_event(&root, id, &ev).unwrap();
+        assert_eq!(load_events(&session_dir(&root, id)).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn drain_intake_moves_files_to_processed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        let id = TaskId::new(1);
+        let intake = session_dir(&root, id).join("hooks/intake");
+        std::fs::create_dir_all(&intake).unwrap();
+        std::fs::write(intake.join("0001.json"), "{}").unwrap();
+        let files = list_intake(&root, id).unwrap();
+        assert_eq!(files.len(), 1);
+        mark_processed(&root, id, &files[0]).unwrap();
+        assert!(!files[0].exists());
+        assert!(session_dir(&root, id).join("hooks/processed/0001.json").exists());
     }
 
     fn sample_task(id: TaskId, title: &str) -> Task {

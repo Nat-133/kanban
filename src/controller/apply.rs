@@ -1,5 +1,6 @@
 // intent application — Task 4
 
+use crate::controller::handoff;
 use crate::controller::store;
 use crate::model::proto::{Intent, Response};
 use crate::model::*;
@@ -26,6 +27,12 @@ pub fn apply(root: &Path, intent: Intent) -> anyhow::Result<Response> {
         Intent::MoveCard { task, to_column, position } => move_card(root, task, to_column, position),
         Intent::ReorderCard { task, position } => reorder_card(root, task, position),
         Intent::ArchiveTask { task } => archive(root, task),
+        Intent::Handoff { task, worker } => {
+            match handoff::handoff(root, task, &worker, &handoff::TmuxLauncher) {
+                Ok(()) => Ok(Response::Ok { task: Some(task) }),
+                Err(e) => Ok(Response::Error { message: e.to_string() }),
+            }
+        }
     }
 }
 

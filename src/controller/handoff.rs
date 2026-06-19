@@ -111,6 +111,22 @@ pub fn prepare_session(
     })
 }
 
+/// Tie handoff together: prepare the session, launch it, persist `session.yaml`,
+/// and record the session ref on the task. Unknown worker -> error.
+pub fn handoff(root: &Path, task_id: TaskId, worker_name: &str, launcher: &dyn Launcher) -> anyhow::Result<()> {
+    let cfg = store::load_config(root)?;
+    let worker = cfg.workers.get(worker_name)
+        .ok_or_else(|| anyhow::anyhow!("unknown worker: {worker_name}"))?;
+    let mut task = store::load_task(root, task_id)?;
+    let session = prepare_session(root, &task, worker_name, worker, &cfg.agents.base_dirs)?;
+    let session_name = substitute(&worker.terminal.session_name, &task_id.to_string(), task.spec.repo.as_deref());
+    launcher.launch(&session, &session_name)?;
+    store::save_session(root, &session)?;
+    task.status.worker_session_ref = Some(session.metadata.name.clone());
+    store::save_task(root, &task)?;
+    Ok(())
+}
+
 fn render_handoff(task: &Task) -> String {
     let mut s = String::new();
     s.push_str(&format!("# Task handoff: {}\n\n", task.metadata.name));
@@ -237,6 +253,40 @@ mod tests {
             self.launched.lock().unwrap().push((session.clone(), session_name.to_string()));
             Ok(())
         }
+    }
+
+    #[test]
+    fn handoff_writes_session_and_sets_task_ref() {
+        use crate::controller::store;
+        use crate::model::TaskId;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        crate::controller::apply::apply(&root, crate::model::proto::Intent::CreateTask {
+            title: "A".into(), summary: "".into(), column: "inbox".parse().unwrap() }).unwrap();
+
+        let fake = FakeLauncher::default();
+        handoff(&root, TaskId::new(1), "claude", &fake).unwrap();
+
+        assert!(root.join("sessions/task-0001/session.yaml").exists());
+        let task = store::load_task(&root, TaskId::new(1)).unwrap();
+        assert_eq!(task.status.worker_session_ref.as_deref(), Some("task-0001-claude"));
+        let launched = fake.launched.lock().unwrap();
+        assert_eq!(launched.len(), 1);
+        assert_eq!(launched[0].1, "kanban-task-0001"); // resolved tmux session name
+    }
+
+    #[test]
+    fn handoff_unknown_worker_errors() {
+        use crate::controller::store;
+        use crate::model::TaskId;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        crate::controller::apply::apply(&root, crate::model::proto::Intent::CreateTask {
+            title: "A".into(), summary: "".into(), column: "inbox".parse().unwrap() }).unwrap();
+        let fake = FakeLauncher::default();
+        assert!(handoff(&root, TaskId::new(1), "nope", &fake).is_err());
     }
 
     #[test]

@@ -132,6 +132,14 @@ fn title_case(s: &str) -> String {
     }).collect::<Vec<_>>().join(" ")
 }
 
+pub fn session_dir(root: &Path, id: TaskId) -> PathBuf { root.join("sessions").join(id.to_string()) }
+
+pub fn save_session(root: &Path, session: &WorkerSession) -> anyhow::Result<()> {
+    let id = session.spec.task_ref;
+    let text = serde_yml::to_string(session)?;
+    atomic_write(&session_dir(root, id).join("session.yaml"), &text)
+}
+
 pub fn load_task(root: &Path, id: TaskId) -> anyhow::Result<Task> {
     let text = fs::read_to_string(task_file(root, id))?;
     Ok(serde_yml::from_str(&text)?)

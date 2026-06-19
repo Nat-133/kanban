@@ -15,6 +15,7 @@ pub enum Intent {
     MoveCard { task: TaskId, to_column: ColumnId, position: Option<usize> },
     ReorderCard { task: TaskId, position: usize },
     ArchiveTask { task: TaskId },
+    Handoff { task: TaskId, worker: String },
 }
 
 /// Replies the controller sends back.
@@ -46,6 +47,13 @@ mod tests {
         let intent = Intent::MoveCard { task: TaskId::new(1), to_column: "doing".parse().unwrap(), position: Some(0) };
         let back: Intent = serde_json::from_str(&serde_json::to_string(&intent).unwrap()).unwrap();
         assert_eq!(intent, back);
+    }
+
+    #[test]
+    fn handoff_intent_round_trips() {
+        let i = Intent::Handoff { task: TaskId::new(1), worker: "claude".into() };
+        let back: Intent = serde_json::from_str(&serde_json::to_string(&i).unwrap()).unwrap();
+        assert_eq!(i, back);
     }
 
     #[test]

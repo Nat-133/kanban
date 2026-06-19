@@ -11,6 +11,7 @@ pub enum Action {
     None,
     Quit,
     Send(Intent),
+    Attach(String),
 }
 
 /// The current input mode of the app.
@@ -156,6 +157,12 @@ impl App {
             KeyCode::Char('c') => {
                 if let Some(t) = self.selected_task() {
                     return Action::Send(Intent::Handoff { task: t, worker: "claude".into() });
+                }
+                Action::None
+            }
+            KeyCode::Char('t') => {
+                if let Some(name) = self.selected_task().and_then(|t| self.session_for(t)).map(|s| s.session_name.clone()) {
+                    return Action::Attach(name);
                 }
                 Action::None
             }
@@ -335,6 +342,22 @@ mod tests {
             o => panic!("expected CreateTask, got {o:?}"),
         }
         assert!(matches!(app.mode(), Mode::Normal));
+    }
+
+    #[test]
+    fn t_attaches_when_session_present() {
+        use crate::model::proto::SessionView;
+        use crate::model::Phase;
+        let mut s = snap();
+        s.sessions = vec![SessionView { task: TaskId::new(1), session_name: "kanban-task-0001".into(), phase: Phase::Working, needs_human_input: false }];
+        let mut app = App::new(s);
+        assert_eq!(app.on_key(key('t')), Action::Attach("kanban-task-0001".into()));
+    }
+
+    #[test]
+    fn t_without_session_is_noop() {
+        let mut app = App::new(snap()); // no sessions
+        assert_eq!(app.on_key(key('t')), Action::None);
     }
 
     #[test]

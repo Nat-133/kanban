@@ -61,6 +61,23 @@ async fn run_loop(
                                         Err(e) => app.status = Some(e.to_string()),
                                     }
                                 }
+                                Action::Attach(name) => {
+                                    // Suspend the TUI, attach to the tmux session (blocking),
+                                    // then restore the terminal and refresh.
+                                    let _ = disable_raw_mode();
+                                    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+                                    let _ = std::process::Command::new("tmux")
+                                        .arg("attach")
+                                        .arg("-t")
+                                        .arg(&name)
+                                        .status();
+                                    let _ = enable_raw_mode();
+                                    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+                                    let _ = terminal.clear();
+                                    if let Ok(s) = client.snapshot().await {
+                                        app.set_snapshot(s);
+                                    }
+                                }
                                 Action::None => {}
                             }
                         }

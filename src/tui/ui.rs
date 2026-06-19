@@ -46,6 +46,9 @@ pub fn render(f: &mut Frame, app: &App) {
                 .enumerate()
                 .map(|(row, task)| {
                     let mut label = card_title(app, *task);
+                    if has_jira(app, *task) {
+                        label = format!("{label} [J]");
+                    }
                     let mut style = Style::default();
                     if let Some(sv) = app.session_for(*task) {
                         label = format!("{label} [{}]", phase_badge(sv.phase));
@@ -125,8 +128,59 @@ pub fn render(f: &mut Frame, app: &App) {
             f.render_widget(Clear, area);
             f.render_widget(para, area);
         }
+        Mode::Detail => {
+            if let Some(task) = app.detail_task() {
+                let spec = &task.spec;
+                let mut lines: Vec<String> = Vec::new();
+                lines.push(spec.title.clone());
+                lines.push(String::new());
+                if !spec.summary.is_empty() {
+                    lines.push(spec.summary.clone());
+                    lines.push(String::new());
+                }
+                if !spec.acceptance_criteria.is_empty() {
+                    lines.push("Acceptance criteria:".to_string());
+                    for ac in &spec.acceptance_criteria {
+                        lines.push(format!("  - {ac}"));
+                    }
+                    lines.push(String::new());
+                }
+                if let Some(repo) = &spec.repo {
+                    lines.push(format!("Repo: {repo}"));
+                }
+                if let Some(key) = &spec.jira.key {
+                    lines.push(format!("Jira: {key}"));
+                }
+                if let Some(url) = &spec.jira.url {
+                    lines.push(format!("Jira URL: {url}"));
+                }
+                lines.push(String::new());
+                lines.push("Press Esc / Enter / q to close.".to_string());
+
+                let height = lines.len() as u16 + 2;
+                let area = centered_rect(60, height, f.area());
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title("Task detail")
+                    .border_style(Style::default().fg(Color::Yellow));
+                let para = Paragraph::new(lines.join("\n")).block(block);
+                f.render_widget(Clear, area);
+                f.render_widget(para, area);
+            }
+        }
         Mode::Normal | Mode::Search => {}
     }
+}
+
+/// Whether a task has a Jira key set in the snapshot.
+fn has_jira(app: &App, task: TaskId) -> bool {
+    let name = task.to_string();
+    app.snapshot()
+        .tasks
+        .iter()
+        .find(|t| t.metadata.name == name)
+        .map(|t| t.spec.jira.key.is_some())
+        .unwrap_or(false)
 }
 
 /// Short badge text for a worker session's phase, shown next to a card title.
@@ -177,6 +231,32 @@ mod tests {
         store::init_workspace(&root).unwrap();
         apply(&root, Intent::CreateTask { title: "Buy milk".into(), summary: "".into(), column: "inbox".parse().unwrap() }).unwrap();
         crate::tui::client::Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap(), sessions: vec![] }
+    }
+
+    fn snap_detail() -> crate::tui::client::Snapshot {
+        use crate::controller::{store, apply::apply};
+        use crate::model::proto::Intent;
+        use crate::model::TaskId;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        apply(&root, Intent::CreateTask { title: "Buy milk".into(), summary: "".into(), column: "inbox".parse().unwrap() }).unwrap();
+        let mut task = store::load_task(&root, TaskId::new(1)).unwrap();
+        task.spec.summary = "from the shop".into();
+        store::save_task(&root, &task).unwrap();
+        crate::tui::client::Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap(), sessions: vec![] }
+    }
+
+    #[test]
+    fn detail_overlay_shows_title_and_summary() {
+        let mut app = App::new(snap_detail());
+        app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE));
+        let backend = TestBackend::new(160, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Buy milk"));
+        assert!(text.contains("from the shop"));
     }
 
     #[test]

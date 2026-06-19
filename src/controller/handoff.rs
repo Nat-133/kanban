@@ -86,6 +86,35 @@ pub fn prepare_session(
         }
     }
 
+    // Per-session Claude Code hooks settings: each event calls back into `kanban hook`.
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "kanban".to_string());
+    let root_abs = std::fs::canonicalize(root)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| root.display().to_string());
+    let mk = |name: &str| {
+        serde_json::json!([{
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": format!("{exe} hook {name} --root {root_abs} --session {id}"),
+            }]
+        }])
+    };
+    let settings = serde_json::json!({ "hooks": {
+        "Notification": mk("notification"),
+        "Stop": mk("stop"),
+        "SessionStart": mk("session-start"),
+        "UserPromptSubmit": mk("user-prompt-submit"),
+        "SessionEnd": mk("session-end"),
+    }});
+    let settings_path = sdir.join("hooks/settings.json");
+    std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+    // inject the flag right after the worker command (index 0)
+    command.insert(1, settings_path.display().to_string());
+    command.insert(1, "--settings".to_string());
+
     // workdir: the task's repo (tilde-expanded) if set, else the session workspace
     let workdir = match repo {
         Some(r) => PathBuf::from(expand_tilde(r)),
@@ -242,6 +271,29 @@ mod tests {
         assert!(session.spec.command.iter().any(|a| a.contains(&format!("sessions/{id}"))));
         assert_eq!(session.spec.task_ref, id);
         assert_eq!(session.metadata.name, format!("{id}-claude"));
+    }
+
+    #[test]
+    fn prepare_session_writes_hook_settings_and_adds_flag() {
+        use crate::controller::store;
+        use crate::model::TaskId;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        let id = TaskId::new(1);
+        let task = sample_task(id, "x");
+        store::save_task(&root, &task).unwrap();
+        let cfg = store::load_config(&root).unwrap();
+        let session = prepare_session(&root, &task, "claude", cfg.workers.get("claude").unwrap(), &cfg.agents.base_dirs).unwrap();
+
+        let settings = root.join("sessions/task-0001/hooks/settings.json");
+        assert!(settings.exists());
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let cmd = v["hooks"]["Notification"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("hook notification"));
+        assert!(cmd.contains("--session task-0001"));
+        let idx = session.spec.command.iter().position(|a| a == "--settings").expect("--settings present");
+        assert_eq!(session.spec.command[idx + 1], settings.display().to_string());
     }
 
     #[derive(Default)]

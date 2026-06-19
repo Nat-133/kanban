@@ -45,8 +45,16 @@ pub fn render(f: &mut Frame, app: &App) {
                 .iter()
                 .enumerate()
                 .map(|(row, task)| {
-                    let label = card_title(app, *task);
+                    let mut label = card_title(app, *task);
                     let mut style = Style::default();
+                    if let Some(sv) = app.session_for(*task) {
+                        label = format!("{label} [{}]", phase_badge(sv.phase));
+                        if sv.needs_human_input {
+                            style = Style::default()
+                                .fg(Color::Red)
+                                .add_modifier(Modifier::BOLD);
+                        }
+                    }
                     if selected_col && app.selected_row() == row {
                         style = style.add_modifier(Modifier::REVERSED);
                     }
@@ -106,6 +114,19 @@ pub fn render(f: &mut Frame, app: &App) {
     }
 }
 
+/// Short badge text for a worker session's phase, shown next to a card title.
+fn phase_badge(phase: crate::model::Phase) -> &'static str {
+    use crate::model::Phase;
+    match phase {
+        Phase::Working => "working",
+        Phase::WaitingHuman => "blocked",
+        Phase::Idle => "idle",
+        Phase::Completed => "done",
+        Phase::Failed => "failed",
+        Phase::Pending => "pending",
+    }
+}
+
 /// Look up a card's display title from the snapshot, falling back to the id.
 fn card_title(app: &App, task: TaskId) -> String {
     let name = task.to_string();
@@ -140,7 +161,7 @@ mod tests {
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
         apply(&root, Intent::CreateTask { title: "Buy milk".into(), summary: "".into(), column: "inbox".parse().unwrap() }).unwrap();
-        crate::tui::client::Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap() }
+        crate::tui::client::Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap(), sessions: vec![] }
     }
 
     #[test]
@@ -154,5 +175,20 @@ mod tests {
         assert!(text.contains("Inbox"), "missing column title Inbox");
         assert!(text.contains("Doing"), "missing column title Doing");
         assert!(text.contains("Buy milk"), "missing card title");
+    }
+
+    #[test]
+    fn renders_worker_state_badge() {
+        use crate::model::proto::SessionView;
+        use crate::model::{Phase, TaskId};
+        let mut s = snap(); // existing ui-test helper with a card "Buy milk" (task-0001) in inbox
+        s.sessions = vec![SessionView { task: TaskId::new(1), session_name: "kanban-task-0001".into(), phase: Phase::WaitingHuman, needs_human_input: true }];
+        let app = App::new(s);
+        let backend = TestBackend::new(160, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Buy milk"));
+        assert!(text.contains("blocked")); // badge text for WaitingHuman
     }
 }

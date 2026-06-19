@@ -8,6 +8,7 @@ use crate::model::{Board, Task};
 pub struct Snapshot {
     pub board: Board,
     pub tasks: Vec<Task>,
+    pub sessions: Vec<crate::model::proto::SessionView>,
 }
 
 pub struct Client {
@@ -31,7 +32,7 @@ impl Client {
 
     pub async fn snapshot(&self) -> anyhow::Result<Snapshot> {
         match self.send(Intent::GetBoard).await? {
-            Response::Snapshot { board, tasks, .. } => Ok(Snapshot { board, tasks }),
+            Response::Snapshot { board, tasks, sessions } => Ok(Snapshot { board, tasks, sessions }),
             Response::Error { message } => Err(anyhow::anyhow!(message)),
             Response::Ok { .. } => Err(anyhow::anyhow!("unexpected Ok response to GetBoard")),
         }

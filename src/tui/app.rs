@@ -84,6 +84,10 @@ impl App {
         }
     }
 
+    pub fn session_for(&self, task: TaskId) -> Option<&crate::model::proto::SessionView> {
+        self.snapshot().sessions.iter().find(|s| s.task == task)
+    }
+
     pub fn selected_task(&self) -> Option<TaskId> {
         self.column_cards(self.col).get(self.row).copied()
     }
@@ -250,7 +254,18 @@ mod tests {
         store::init_workspace(&root).unwrap();
         apply(&root, Intent::CreateTask { title: "First".into(), summary: "".into(), column: "inbox".parse().unwrap() }).unwrap();
         apply(&root, Intent::CreateTask { title: "Second".into(), summary: "".into(), column: "inbox".parse().unwrap() }).unwrap();
-        Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap() }
+        Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap(), sessions: vec![] }
+    }
+
+    #[test]
+    fn session_for_finds_matching_session() {
+        use crate::model::proto::SessionView;
+        use crate::model::Phase;
+        let mut s = snap(); // existing helper: inbox has task-0001, task-0002
+        s.sessions = vec![SessionView { task: TaskId::new(1), session_name: "kanban-task-0001".into(), phase: Phase::WaitingHuman, needs_human_input: true }];
+        let app = App::new(s);
+        assert_eq!(app.session_for(TaskId::new(1)).unwrap().phase, Phase::WaitingHuman);
+        assert!(app.session_for(TaskId::new(2)).is_none());
     }
 
     #[test]

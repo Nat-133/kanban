@@ -63,13 +63,17 @@ async fn run_loop(
                                 }
                                 Action::Attach(name) => {
                                     // Suspend the TUI, attach to the tmux session (blocking),
-                                    // then restore the terminal and refresh.
+                                    // then restore the terminal and refresh. Clearing $TMUX
+                                    // lets `attach` work when the TUI itself runs inside tmux
+                                    // (otherwise tmux refuses to nest); the worker just opens
+                                    // as a nested client in this pane.
                                     let _ = disable_raw_mode();
                                     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
                                     let _ = std::process::Command::new("tmux")
                                         .arg("attach")
                                         .arg("-t")
                                         .arg(&name)
+                                        .env_remove("TMUX")
                                         .status();
                                     let _ = enable_raw_mode();
                                     let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);

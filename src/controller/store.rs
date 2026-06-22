@@ -154,6 +154,31 @@ pub fn load_all_sessions(root: &Path) -> anyhow::Result<Vec<WorkerSession>> {
     Ok(out)
 }
 
+/// Load a single persisted worker session, if one exists for `id`.
+pub fn load_session(root: &Path, id: TaskId) -> anyhow::Result<Option<WorkerSession>> {
+    let p = session_dir(root, id).join("session.yaml");
+    if !p.exists() {
+        return Ok(None);
+    }
+    Ok(Some(serde_yml::from_str(&fs::read_to_string(&p)?)?))
+}
+
+/// Move a task's session workspace under its archive dir. No-op if there is none.
+/// Keeps the spool/events for debugging while taking the session out of the live
+/// `sessions/` tree, so the reconcile loop no longer sees it.
+pub fn archive_session_dir(root: &Path, id: TaskId) -> anyhow::Result<()> {
+    let from = session_dir(root, id);
+    if !from.exists() {
+        return Ok(());
+    }
+    let to = root.join("archive").join(id.to_string()).join("session");
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(from, to)?;
+    Ok(())
+}
+
 pub fn load_task(root: &Path, id: TaskId) -> anyhow::Result<Task> {
     let text = fs::read_to_string(task_file(root, id))?;
     Ok(serde_yml::from_str(&text)?)

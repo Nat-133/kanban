@@ -61,13 +61,18 @@ pub fn save_board(root: &Path, board: &Board) -> anyhow::Result<()> {
 
 /// Next sequential id. Collision-free because the controller is the single writer.
 pub fn next_task_id(root: &Path) -> anyhow::Result<TaskId> {
-    let tasks = root.join("tasks");
+    // Scan both live and archived tasks so ids are monotonic for the workspace's
+    // lifetime: reusing an archived id would collide with its archived task and
+    // session directories.
     let mut max = 0u32;
-    if tasks.exists() {
-        for entry in fs::read_dir(&tasks)? {
-            let name = entry?.file_name().to_string_lossy().into_owned();
-            if let Ok(id) = name.parse::<TaskId>() {
-                max = max.max(id.as_u32());
+    for sub in ["tasks", "archive"] {
+        let dir = root.join(sub);
+        if dir.exists() {
+            for entry in fs::read_dir(&dir)? {
+                let name = entry?.file_name().to_string_lossy().into_owned();
+                if let Ok(id) = name.parse::<TaskId>() {
+                    max = max.max(id.as_u32());
+                }
             }
         }
     }
@@ -315,6 +320,20 @@ mod tests {
         fs::create_dir_all(tasks.join("task-0007")).unwrap();
         fs::create_dir_all(tasks.join("not-a-task")).unwrap();
         assert_eq!(next_task_id(dir.path()).unwrap(), TaskId::new(8));
+    }
+
+    #[test]
+    fn next_task_id_does_not_reuse_archived_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        save_task(&root, &sample_task(TaskId::new(1), "A")).unwrap();
+        save_task(&root, &sample_task(TaskId::new(2), "B")).unwrap();
+        archive_task(&root, TaskId::new(2)).unwrap();
+        archive_task(&root, TaskId::new(1)).unwrap();
+        // tasks/ is now empty but archive/ holds 1 and 2: the next id must clear
+        // both, or a new task collides with archived task (and session) dirs.
+        assert_eq!(next_task_id(&root).unwrap(), TaskId::new(3));
     }
 
     #[test]

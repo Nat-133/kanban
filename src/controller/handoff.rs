@@ -49,6 +49,11 @@ pub fn prepare_session(
     let sdir = root.join("sessions").join(id.to_string());
     std::fs::create_dir_all(sdir.join("hooks/intake"))?;
     std::fs::create_dir_all(sdir.join("hooks/processed"))?;
+    // Canonicalize to an absolute path: the worker runs with `sdir` (or the repo)
+    // as its cwd, so the `--settings` and `--add-dir` paths derived from it must be
+    // absolute or they won't resolve. A relative `--root` would otherwise launch a
+    // worker that dies instantly on a missing settings file.
+    let sdir = std::fs::canonicalize(&sdir)?;
 
     // symlink each allowlisted context file (relative to the task dir) into the session dir
     for entry in &task.spec.context.include {
@@ -79,6 +84,11 @@ pub fn prepare_session(
     for arg in &worker.args {
         command.push(substitute(arg, &task_id, repo));
     }
+    // Always allowlist the session workspace by absolute path. When a task has a
+    // repo the worker's cwd is the repo, so a relative `--add-dir` would resolve
+    // there and the worker couldn't read its own handoff.md / write notes.md.
+    command.push("--add-dir".to_string());
+    command.push(sdir.display().to_string());
     for entry in base_dirs {
         for path in expand_base_dir(entry) {
             command.push("--add-dir".to_string());
@@ -114,6 +124,18 @@ pub fn prepare_session(
     // inject the flag right after the worker command (index 0)
     command.insert(1, settings_path.display().to_string());
     command.insert(1, "--settings".to_string());
+
+    // Seed Claude's first turn with the task, otherwise it launches into an idle
+    // interactive session and never reads the handoff. Insert it right after the
+    // `--settings <path>` pair (now at indices 1 and 2): a leading positional
+    // could be mistaken for the `[command]` subcommand slot, while a trailing one
+    // would be swallowed by the variadic `--add-dir <dirs...>` that follows.
+    let prompt = format!(
+        "Read the task handoff at {} and start working on the task it describes, \
+         following the instructions in that file.",
+        sdir.join("handoff.md").display()
+    );
+    command.insert(3, prompt);
 
     // workdir: the task's repo (tilde-expanded) if set, else the session workspace
     let workdir = match repo {
@@ -272,6 +294,56 @@ mod tests {
         assert!(session.spec.command.iter().any(|a| a.contains(&format!("sessions/{id}"))));
         assert_eq!(session.spec.task_ref, id);
         assert_eq!(session.metadata.name, format!("{id}-claude"));
+        // no repo set -> workdir is the session dir, and it must be absolute so the
+        // relative-path-from-root launch bug can't recur
+        assert!(session.spec.workdir.as_ref().unwrap().is_absolute());
+    }
+
+    #[test]
+    fn prepare_session_allowlists_session_dir_by_absolute_path() {
+        use crate::controller::store;
+        use crate::model::TaskId;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        let id = TaskId::new(1);
+        let mut task = sample_task(id, "Do the thing");
+        // A repo means cwd is the repo, not the session dir, so the session dir
+        // holding handoff.md must be allowlisted by absolute path.
+        task.spec.repo = Some("~/vcs/whatever".into());
+        store::save_task(&root, &task).unwrap();
+        let cfg = store::load_config(&root).unwrap();
+        let session = prepare_session(&root, &task, "claude", cfg.workers.get("claude").unwrap(), &cfg.agents.base_dirs).unwrap();
+
+        let sdir = session.spec.workspace.display().to_string();
+        let cmd = &session.spec.command;
+        let idx = cmd.iter().position(|a| a == &sdir)
+            .unwrap_or_else(|| panic!("session dir {sdir} not allowlisted; cmd={cmd:?}"));
+        assert_eq!(cmd[idx - 1], "--add-dir", "session dir must follow --add-dir; cmd={cmd:?}");
+    }
+
+    #[test]
+    fn prepare_session_seeds_an_initial_prompt_pointing_at_handoff() {
+        use crate::controller::store;
+        use crate::model::TaskId;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        let id = TaskId::new(1);
+        let task = sample_task(id, "Do the thing");
+        store::save_task(&root, &task).unwrap();
+        let cfg = store::load_config(&root).unwrap();
+        let session = prepare_session(&root, &task, "claude", cfg.workers.get("claude").unwrap(), &cfg.agents.base_dirs).unwrap();
+
+        // Without an initial prompt the worker launches into an idle interactive
+        // session: some command arg must point it at its handoff brief.
+        let cmd = &session.spec.command;
+        let handoff = session.spec.workspace.join("handoff.md").display().to_string();
+        let idx = cmd.iter().position(|a| a.contains(&handoff))
+            .unwrap_or_else(|| panic!("no initial prompt referencing {handoff}; cmd={cmd:?}"));
+        // It must not be the final token: a trailing positional would be eaten by
+        // the variadic `--add-dir <dirs...>` that precedes it.
+        assert!(idx < cmd.len() - 1, "prompt must not be the last arg; cmd={cmd:?}");
     }
 
     #[test]
@@ -294,7 +366,10 @@ mod tests {
         assert!(cmd.contains("hook notification"));
         assert!(cmd.contains("--session task-0001"));
         let idx = session.spec.command.iter().position(|a| a == "--settings").expect("--settings present");
-        assert_eq!(session.spec.command[idx + 1], settings.display().to_string());
+        // command stores the canonicalized (absolute) path so it resolves from any cwd
+        let settings_canon = std::fs::canonicalize(&settings).unwrap();
+        assert_eq!(session.spec.command[idx + 1], settings_canon.display().to_string());
+        assert!(settings_canon.is_absolute());
     }
 
     #[derive(Default)]

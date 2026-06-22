@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 pub trait Launcher {
     /// `session_name` is the resolved terminal session name (e.g. the tmux session).
     fn launch(&self, session: &WorkerSession, session_name: &str) -> anyhow::Result<()>;
+    /// Best-effort teardown of a running session. Tearing down a session that is
+    /// already gone is not an error.
+    fn kill(&self, session_name: &str);
 }
 
 /// Real launcher: starts a detached tmux session running the worker command.
@@ -27,6 +30,14 @@ impl Launcher for TmuxLauncher {
             anyhow::bail!("tmux new-session failed with status {status}");
         }
         Ok(())
+    }
+
+    fn kill(&self, session_name: &str) {
+        let _ = std::process::Command::new("tmux")
+            .arg("kill-session")
+            .arg("-t")
+            .arg(session_name)
+            .status();
     }
 }
 
@@ -381,6 +392,7 @@ mod tests {
             self.launched.lock().unwrap().push((session.clone(), session_name.to_string()));
             Ok(())
         }
+        fn kill(&self, _session_name: &str) {}
     }
 
     #[test]

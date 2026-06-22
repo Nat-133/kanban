@@ -36,7 +36,7 @@ pub fn apply(root: &Path, intent: Intent) -> anyhow::Result<Response> {
         Intent::EditTask { task, title, summary } => edit_task(root, task, title, summary),
         Intent::MoveCard { task, to_column, position } => move_card(root, task, to_column, position),
         Intent::ReorderCard { task, position } => reorder_card(root, task, position),
-        Intent::ArchiveTask { task } => archive(root, task),
+        Intent::ArchiveTask { task } => archive(root, task, &handoff::TmuxLauncher),
         Intent::Handoff { task, worker } => {
             match handoff::handoff(root, task, &worker, &handoff::TmuxLauncher) {
                 Ok(()) => Ok(Response::Ok { task: Some(task) }),
@@ -146,7 +146,7 @@ fn reorder_card(root: &Path, task_id: TaskId, position: usize) -> anyhow::Result
     Ok(Response::Ok { task: Some(task_id) })
 }
 
-fn archive(root: &Path, task_id: TaskId) -> anyhow::Result<Response> {
+fn archive(root: &Path, task_id: TaskId, launcher: &dyn handoff::Launcher) -> anyhow::Result<Response> {
     let mut raw: RawBoard = store::load_board_checked(root)?.into();
     remove_card(&mut raw, task_id);
     let board = match Board::try_from(raw) {
@@ -154,7 +154,17 @@ fn archive(root: &Path, task_id: TaskId) -> anyhow::Result<Response> {
         Err(e) => return Ok(Response::Error { message: e.to_string() }),
     };
     store::save_board(root, &board)?;
+    // Tear down any worker: kill its terminal session, then take the session
+    // workspace out of the live `sessions/` tree alongside the task. Otherwise
+    // the worker keeps running and the reconcile loop can resurrect a phantom
+    // card for the now-archived task.
+    if let Some(session) = store::load_session(root, task_id)? {
+        if let Some(name) = session.spec.session_name.as_deref() {
+            launcher.kill(name);
+        }
+    }
     store::archive_task(root, task_id)?;
+    store::archive_session_dir(root, task_id)?;
     Ok(Response::Ok { task: Some(task_id) })
 }
 
@@ -201,6 +211,7 @@ mod tests {
     struct NoLaunch;
     impl crate::controller::handoff::Launcher for NoLaunch {
         fn launch(&self, _s: &crate::model::WorkerSession, _n: &str) -> anyhow::Result<()> { Ok(()) }
+        fn kill(&self, _n: &str) {}
     }
 
     #[test]
@@ -265,6 +276,34 @@ mod tests {
         apply(&r, Intent::ReorderCard { task: TaskId::new(2), position: 0 }).unwrap();
         let board = crate::controller::store::load_board(&r).unwrap();
         assert_eq!(board.cards().get(&col("inbox")).unwrap(), &vec![TaskId::new(2), TaskId::new(1)]);
+    }
+
+    #[derive(Default)]
+    struct FakeLauncher {
+        killed: std::sync::Mutex<Vec<String>>,
+    }
+    impl handoff::Launcher for FakeLauncher {
+        fn launch(&self, _session: &WorkerSession, _session_name: &str) -> anyhow::Result<()> { Ok(()) }
+        fn kill(&self, session_name: &str) { self.killed.lock().unwrap().push(session_name.to_string()); }
+    }
+
+    #[test]
+    fn archive_kills_session_and_moves_session_dir() {
+        let d = setup(); let r = root(&d);
+        apply(&r, Intent::CreateTask { title: "A".into(), summary: "".into(), column: col("inbox") }).unwrap();
+        let id = TaskId::new(1);
+        // hand off (fake launcher) so a session.yaml + sessions/ dir exist
+        handoff::handoff(&r, id, "claude", &FakeLauncher::default()).unwrap();
+        assert!(store::session_dir(&r, id).join("session.yaml").exists());
+
+        let fake = FakeLauncher::default();
+        archive(&r, id, &fake).unwrap();
+
+        // session taken out of the live sessions/ tree (no phantom resurrection)…
+        assert!(!store::session_dir(&r, id).exists(), "session dir must leave sessions/");
+        assert!(r.join("archive/task-0001/session").exists(), "session dir should be archived");
+        // …and the terminal session asked to be torn down
+        assert_eq!(&*fake.killed.lock().unwrap(), &["kanban-task-0001".to_string()]);
     }
 
     #[test]

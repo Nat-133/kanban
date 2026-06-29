@@ -13,6 +13,8 @@ pub enum Action {
     Send(Intent),
     /// Open the named tmux session in the embedded terminal popup.
     OpenTerminal(String),
+    /// Attach to the named tmux session full-screen (suspending the TUI).
+    AttachFullscreen(String),
 }
 
 /// The current input mode of the app.
@@ -238,6 +240,12 @@ impl App {
             KeyCode::Char('t') => {
                 if let Some(name) = self.selected_task().and_then(|t| self.session_for(t)).map(|s| s.session_name.clone()) {
                     return Action::OpenTerminal(name);
+                }
+                Action::None
+            }
+            KeyCode::Char('T') => {
+                if let Some(name) = self.selected_task().and_then(|t| self.session_for(t)).map(|s| s.session_name.clone()) {
+                    return Action::AttachFullscreen(name);
                 }
                 Action::None
             }
@@ -514,6 +522,22 @@ mod tests {
     fn t_without_session_is_noop() {
         let mut app = App::new(snap()); // no sessions
         assert_eq!(app.on_key(key('t')), Action::None);
+    }
+
+    #[test]
+    fn shift_t_attaches_fullscreen_when_session_present() {
+        use crate::model::proto::SessionView;
+        use crate::model::Phase;
+        let mut s = snap();
+        s.sessions = vec![SessionView { task: TaskId::new(1), session_name: "kanban-task-0001".into(), phase: Phase::Working, needs_human_input: false }];
+        let mut app = App::new(s);
+        assert_eq!(app.on_key(key('T')), Action::AttachFullscreen("kanban-task-0001".into()));
+    }
+
+    #[test]
+    fn shift_t_without_session_is_noop() {
+        let mut app = App::new(snap()); // no sessions
+        assert_eq!(app.on_key(key('T')), Action::None);
     }
 
     #[test]

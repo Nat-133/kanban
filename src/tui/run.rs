@@ -10,6 +10,7 @@ use crossterm::terminal::{
 };
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 use std::io::Stdout;
 
@@ -101,8 +102,11 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                                     refresh(&client, &mut app).await;
                                 }
                                 Post::Fullscreen(name) => {
+                                    // Close the popup and repaint the board once,
+                                    // then hand off to the full-screen attach.
                                     term = None;
                                     app.exit_terminal();
+                                    terminal.draw(|f| crate::tui::ui::render(f, &app, None))?;
                                     fullscreen_attach(terminal, &name);
                                     refresh(&client, &mut app).await;
                                 }
@@ -126,6 +130,10 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                                         }
                                         Err(e) => app.status = Some(e.to_string()),
                                     }
+                                }
+                                Action::AttachFullscreen(name) => {
+                                    fullscreen_attach(terminal, &name);
+                                    refresh(&client, &mut app).await;
                                 }
                                 Action::None => {}
                             }
@@ -186,5 +194,12 @@ fn fullscreen_attach(terminal: &mut Term, name: &str) {
         .status();
     let _ = enable_raw_mode();
     let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
-    let _ = terminal.clear();
+    // Force a query-free full repaint. `Terminal::clear()` first queries the
+    // cursor position over stdin, which races with the live crossterm
+    // EventStream reader and silently no-ops (leaving tmux residue on screen);
+    // `resize` clears the viewport and resets the back buffer without touching
+    // stdin, so the next draw repaints every cell.
+    if let Ok(size) = terminal.size() {
+        let _ = terminal.resize(Rect::new(0, 0, size.width, size.height));
+    }
 }

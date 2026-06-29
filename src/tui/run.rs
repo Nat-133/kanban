@@ -1,8 +1,9 @@
 // async event loop — Task 5
 
-use crate::tui::app::{Action, App};
+use crate::tui::app::{Action, App, Mode};
 use crate::tui::client::Client;
-use crossterm::event::KeyEventKind;
+use crate::tui::term::{handle_prefixed_key, popup_pty_size, TermAction, TermSession};
+use crossterm::event::{Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -11,6 +12,8 @@ use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::Stdout;
+
+type Term = Terminal<CrosstermBackend<Stdout>>;
 
 pub async fn run(base: String) -> anyhow::Result<()> {
     // Terminal setup.
@@ -31,10 +34,15 @@ pub async fn run(base: String) -> anyhow::Result<()> {
     result
 }
 
-async fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    base: String,
-) -> anyhow::Result<()> {
+/// What to do after routing a key while the terminal popup is open. Computed
+/// under a short borrow of the session so the loop can then mutate `term`.
+enum Post {
+    Nothing,
+    Close,
+    Fullscreen(String),
+}
+
+async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
     let client = Client::new(base.clone());
     let snap = client.snapshot().await?;
     let mut app = App::new(snap);
@@ -42,62 +50,108 @@ async fn run_loop(
     let mut sse = reqwest_eventsource::EventSource::get(format!("{base}/v1/events"));
     let mut input = crossterm::event::EventStream::new();
 
+    // The reader thread of an active `TermSession` signals this channel whenever
+    // the PTY produces output, waking the select loop to redraw.
+    let (redraw_tx, mut redraw_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let mut term: Option<TermSession> = None;
+
     loop {
-        terminal.draw(|f| crate::tui::ui::render(f, &app))?;
+        // Reap a session whose child has exited (e.g. tmux detached/killed).
+        if term.as_mut().map(|t| !t.is_alive()).unwrap_or(false) {
+            term = None;
+            app.exit_terminal();
+        }
+
+        // Draw. Hold a read lock on the parser only for the duration of the frame.
+        {
+            let guard = term.as_ref().map(|t| t.parser().read().unwrap());
+            let screen = guard.as_deref().map(|p| p.screen());
+            terminal.draw(|f| crate::tui::ui::render(f, &app, screen))?;
+        }
 
         tokio::select! {
             maybe = input.next() => {
                 match maybe {
-                    Some(Ok(crossterm::event::Event::Key(key))) => {
-                        if key.kind == KeyEventKind::Press {
+                    Some(Ok(Event::Key(key))) => {
+                        if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
+                        if matches!(app.mode(), Mode::Terminal) {
+                            // Route the key through the Ctrl+G prefix machine.
+                            let post = if let Some(t) = term.as_mut() {
+                                let (armed, action) = handle_prefixed_key(t.prefix_armed, key);
+                                t.prefix_armed = armed;
+                                match action {
+                                    TermAction::Forward(bytes) => {
+                                        let _ = t.write_input(&bytes);
+                                        Post::Nothing
+                                    }
+                                    TermAction::None => Post::Nothing,
+                                    TermAction::Close => Post::Close,
+                                    TermAction::Fullscreen => Post::Fullscreen(t.name().to_string()),
+                                }
+                            } else {
+                                Post::Nothing
+                            };
+                            match post {
+                                Post::Nothing => {}
+                                Post::Close => {
+                                    term = None;
+                                    app.exit_terminal();
+                                    refresh(&client, &mut app).await;
+                                }
+                                Post::Fullscreen(name) => {
+                                    term = None;
+                                    app.exit_terminal();
+                                    fullscreen_attach(terminal, &name);
+                                    refresh(&client, &mut app).await;
+                                }
+                            }
+                        } else {
                             match app.on_key(key) {
                                 Action::Quit => break,
                                 Action::Send(intent) => {
                                     match client.send(intent).await {
-                                        Ok(_) => match client.snapshot().await {
-                                            Ok(s) => app.set_snapshot(s),
-                                            Err(e) => app.status = Some(e.to_string()),
-                                        },
+                                        Ok(_) => refresh(&client, &mut app).await,
                                         Err(e) => app.status = Some(e.to_string()),
                                     }
                                 }
-                                Action::Attach(name) => {
-                                    // Suspend the TUI, attach to the tmux session (blocking),
-                                    // then restore the terminal and refresh. Clearing $TMUX
-                                    // lets `attach` work when the TUI itself runs inside tmux
-                                    // (otherwise tmux refuses to nest); the worker just opens
-                                    // as a nested client in this pane.
-                                    let _ = disable_raw_mode();
-                                    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-                                    let _ = std::process::Command::new("tmux")
-                                        .arg("attach")
-                                        .arg("-t")
-                                        .arg(&name)
-                                        .env_remove("TMUX")
-                                        .status();
-                                    let _ = enable_raw_mode();
-                                    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
-                                    let _ = terminal.clear();
-                                    if let Ok(s) = client.snapshot().await {
-                                        app.set_snapshot(s);
+                                Action::OpenTerminal(name) => {
+                                    let size = terminal.size()?;
+                                    let (rows, cols) = popup_pty_size(size.width, size.height);
+                                    match TermSession::attach(&name, rows, cols, redraw_tx.clone()) {
+                                        Ok(t) => {
+                                            term = Some(t);
+                                            app.enter_terminal();
+                                        }
+                                        Err(e) => app.status = Some(e.to_string()),
                                     }
                                 }
                                 Action::None => {}
                             }
                         }
                     }
-                    // Non-key terminal events (resize, mouse, etc.) — redraw.
+                    // Terminal resize — keep the PTY in sync with the popup.
+                    Some(Ok(Event::Resize(w, h))) => {
+                        if let Some(t) = term.as_mut() {
+                            let (rows, cols) = popup_pty_size(w, h);
+                            t.resize(rows, cols);
+                        }
+                    }
+                    // Other terminal events — redraw on next loop.
                     Some(Ok(_)) => {}
                     // Input stream ended or errored — exit.
                     Some(Err(_)) | None => break,
                 }
             }
+            // PTY produced output: drain extra signals, then redraw.
+            _ = redraw_rx.recv() => {
+                while redraw_rx.try_recv().is_ok() {}
+            }
             ev = sse.next() => {
                 match ev {
                     Some(Ok(reqwest_eventsource::Event::Message(_))) => {
-                        if let Ok(s) = client.snapshot().await {
-                            app.set_snapshot(s);
-                        }
+                        refresh(&client, &mut app).await;
                     }
                     // Open / transient error / stream end — keep the loop alive.
                     Some(Ok(reqwest_eventsource::Event::Open)) => {}
@@ -108,4 +162,29 @@ async fn run_loop(
     }
 
     Ok(())
+}
+
+/// Refresh the app's snapshot from the controller, surfacing errors to status.
+async fn refresh(client: &Client, app: &mut App) {
+    match client.snapshot().await {
+        Ok(s) => app.set_snapshot(s),
+        Err(e) => app.status = Some(e.to_string()),
+    }
+}
+
+/// Suspend the TUI and attach to a tmux session full-screen (the fallback from
+/// the popup, via `Ctrl+G T`). Clearing `$TMUX` lets `attach` work when the TUI
+/// itself runs inside tmux; on detach we restore the alternate screen.
+fn fullscreen_attach(terminal: &mut Term, name: &str) {
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = std::process::Command::new("tmux")
+        .arg("attach")
+        .arg("-t")
+        .arg(name)
+        .env_remove("TMUX")
+        .status();
+    let _ = enable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+    let _ = terminal.clear();
 }

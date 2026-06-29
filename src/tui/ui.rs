@@ -9,8 +9,9 @@ use crate::model::TaskId;
 use crate::tui::app::{App, Mode};
 
 /// Render the full board: one bordered column per board column, a footer key
-/// hint, and (when active) a centered add-task or help overlay.
-pub fn render(f: &mut Frame, app: &App) {
+/// hint, and (when active) a centered overlay. When the terminal popup is open,
+/// `term_screen` carries the live PTY screen to render.
+pub fn render(f: &mut Frame, app: &App, term_screen: Option<&tui_term::vt100::Screen>) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -168,6 +169,16 @@ pub fn render(f: &mut Frame, app: &App) {
                 f.render_widget(para, area);
             }
         }
+        Mode::Terminal => {
+            if let Some(screen) = term_screen {
+                let title = app
+                    .selected_task()
+                    .and_then(|t| app.session_for(t))
+                    .map(|s| s.session_name.clone())
+                    .unwrap_or_else(|| "terminal".to_string());
+                crate::tui::term::render_terminal_popup(f, f.area(), screen, &title);
+            }
+        }
         Mode::Normal | Mode::Search => {}
     }
 }
@@ -253,7 +264,7 @@ mod tests {
         app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE));
         let backend = TestBackend::new(160, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, &app)).unwrap();
+        terminal.draw(|f| render(f, &app, None)).unwrap();
         let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Buy milk"));
         assert!(text.contains("from the shop"));
@@ -264,7 +275,7 @@ mod tests {
         let app = App::new(snap());
         let backend = TestBackend::new(160, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, &app)).unwrap();
+        terminal.draw(|f| render(f, &app, None)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Inbox"), "missing column title Inbox");
@@ -281,9 +292,29 @@ mod tests {
         let app = App::new(s);
         let backend = TestBackend::new(160, 30);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, &app)).unwrap();
+        terminal.draw(|f| render(f, &app, None)).unwrap();
         let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Buy milk"));
         assert!(text.contains("blocked")); // badge text for WaitingHuman
+    }
+
+    #[test]
+    fn terminal_mode_renders_pty_popup_with_session_title() {
+        use crate::model::proto::SessionView;
+        use crate::model::{Phase, TaskId};
+        let mut s = snap();
+        s.sessions = vec![SessionView { task: TaskId::new(1), session_name: "kanban-task-0001".into(), phase: Phase::Working, needs_human_input: false }];
+        let mut app = App::new(s);
+        app.enter_terminal();
+
+        let mut parser = tui_term::vt100::Parser::new(24, 80, 0);
+        parser.process(b"live-shell-output");
+
+        let backend = TestBackend::new(160, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app, Some(parser.screen()))).unwrap();
+        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("live-shell-output"), "should render live PTY screen contents");
+        assert!(text.contains("kanban-task-0001"), "popup title should show the session name");
     }
 }

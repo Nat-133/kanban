@@ -11,7 +11,8 @@ pub enum Action {
     None,
     Quit,
     Send(Intent),
-    Attach(String),
+    /// Open the named tmux session in the embedded terminal popup.
+    OpenTerminal(String),
 }
 
 /// The current input mode of the app.
@@ -23,6 +24,8 @@ pub enum Mode {
     Search,
     Help,
     Detail,
+    /// The embedded terminal popup is open; key input is routed to the PTY.
+    Terminal,
 }
 
 /// Pure TUI state: holds the latest snapshot, the cursor (column/row), the
@@ -162,7 +165,20 @@ impl App {
                 self.mode = Mode::Normal;
                 Action::None
             }
+            // Terminal input is routed straight to the PTY by the run loop, so
+            // it never reaches `on_key`; handled here only for exhaustiveness.
+            Mode::Terminal => Action::None,
         }
+    }
+
+    /// Enter terminal-popup mode (the run loop owns the live `TermSession`).
+    pub fn enter_terminal(&mut self) {
+        self.mode = Mode::Terminal;
+    }
+
+    /// Leave terminal-popup mode and return to the board.
+    pub fn exit_terminal(&mut self) {
+        self.mode = Mode::Normal;
     }
 
     fn on_detail(&mut self, key: KeyEvent) -> Action {
@@ -221,7 +237,7 @@ impl App {
             }
             KeyCode::Char('t') => {
                 if let Some(name) = self.selected_task().and_then(|t| self.session_for(t)).map(|s| s.session_name.clone()) {
-                    return Action::Attach(name);
+                    return Action::OpenTerminal(name);
                 }
                 Action::None
             }
@@ -485,19 +501,28 @@ mod tests {
     }
 
     #[test]
-    fn t_attaches_when_session_present() {
+    fn t_opens_terminal_when_session_present() {
         use crate::model::proto::SessionView;
         use crate::model::Phase;
         let mut s = snap();
         s.sessions = vec![SessionView { task: TaskId::new(1), session_name: "kanban-task-0001".into(), phase: Phase::Working, needs_human_input: false }];
         let mut app = App::new(s);
-        assert_eq!(app.on_key(key('t')), Action::Attach("kanban-task-0001".into()));
+        assert_eq!(app.on_key(key('t')), Action::OpenTerminal("kanban-task-0001".into()));
     }
 
     #[test]
     fn t_without_session_is_noop() {
         let mut app = App::new(snap()); // no sessions
         assert_eq!(app.on_key(key('t')), Action::None);
+    }
+
+    #[test]
+    fn enter_and_exit_terminal_toggle_mode() {
+        let mut app = App::new(snap());
+        app.enter_terminal();
+        assert!(matches!(app.mode(), Mode::Terminal));
+        app.exit_terminal();
+        assert!(matches!(app.mode(), Mode::Normal));
     }
 
     #[test]

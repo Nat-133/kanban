@@ -23,12 +23,14 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = { version = "0.28", features = ["event-stream"] }
 reqwest = { version = "0.12", features = ["json"] }
 reqwest-eventsource = "0.6"
 futures-util = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
+tui-term = { version = "0.3.4", features = ["unstable"] }
+portable-pty = "0.9"
 
 [dev-dependencies]
 tempfile = "3"

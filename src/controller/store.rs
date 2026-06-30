@@ -59,20 +59,31 @@ pub fn save_board(root: &Path, board: &Board) -> anyhow::Result<()> {
     atomic_write(&board_path(root), &text)
 }
 
+/// Verify `root` is an initialized workspace (its `board.yaml` exists),
+/// returning a clear, actionable error if not. The daemon calls this at startup
+/// so it fails fast instead of binding the port and serving ENOENT on every
+/// request (e.g. when launched from the wrong directory).
+pub fn ensure_workspace(root: &Path) -> anyhow::Result<()> {
+    if !board_path(root).exists() {
+        anyhow::bail!(
+            "no kanban workspace at {} (board.yaml not found) — run `kanban init` or pass --root <dir>",
+            root.display()
+        );
+    }
+    Ok(())
+}
+
 /// Next sequential id. Collision-free because the controller is the single writer.
 pub fn next_task_id(root: &Path) -> anyhow::Result<TaskId> {
-    // Scan both live and archived tasks so ids are monotonic for the workspace's
-    // lifetime: reusing an archived id would collide with its archived task and
-    // session directories.
+    // Archived tasks stay in tasks/ (just flagged), so scanning tasks/ keeps ids
+    // monotonic for the workspace lifetime — no archived id is ever freed.
+    let tasks = root.join("tasks");
     let mut max = 0u32;
-    for sub in ["tasks", "archive"] {
-        let dir = root.join(sub);
-        if dir.exists() {
-            for entry in fs::read_dir(&dir)? {
-                let name = entry?.file_name().to_string_lossy().into_owned();
-                if let Ok(id) = name.parse::<TaskId>() {
-                    max = max.max(id.as_u32());
-                }
+    if tasks.exists() {
+        for entry in fs::read_dir(&tasks)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if let Ok(id) = name.parse::<TaskId>() {
+                max = max.max(id.as_u32());
             }
         }
     }
@@ -98,7 +109,6 @@ fn task_file(root: &Path, id: TaskId) -> PathBuf { task_dir(root, id).join("task
 pub fn init_workspace(root: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(tasks_dir(root))?;
     fs::create_dir_all(root.join("sessions"))?;
-    fs::create_dir_all(root.join("archive"))?;
     if !board_path(root).exists() {
         let board = Board::try_from(default_board())
             .map_err(|e| anyhow::anyhow!("default board invalid: {e}"))?;
@@ -168,19 +178,13 @@ pub fn load_session(root: &Path, id: TaskId) -> anyhow::Result<Option<WorkerSess
     Ok(Some(serde_yml::from_str(&fs::read_to_string(&p)?)?))
 }
 
-/// Move a task's session workspace under its archive dir. No-op if there is none.
-/// Keeps the spool/events for debugging while taking the session out of the live
-/// `sessions/` tree, so the reconcile loop no longer sees it.
-pub fn archive_session_dir(root: &Path, id: TaskId) -> anyhow::Result<()> {
-    let from = session_dir(root, id);
-    if !from.exists() {
-        return Ok(());
+/// Remove a task's session workspace. No-op if there is none. Called on archive
+/// to drop the dead worker's runtime state so the reconcile loop stops seeing it.
+pub fn remove_session_dir(root: &Path, id: TaskId) -> anyhow::Result<()> {
+    let dir = session_dir(root, id);
+    if dir.exists() {
+        fs::remove_dir_all(&dir)?;
     }
-    let to = root.join("archive").join(id.to_string()).join("session");
-    if let Some(parent) = to.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::rename(from, to)?;
     Ok(())
 }
 
@@ -208,14 +212,6 @@ pub fn load_all_tasks(root: &Path) -> anyhow::Result<Vec<Task>> {
         }
     }
     Ok(out)
-}
-
-pub fn archive_task(root: &Path, id: TaskId) -> anyhow::Result<()> {
-    let from = task_dir(root, id);
-    let to = root.join("archive").join(id.to_string());
-    fs::create_dir_all(root.join("archive"))?;
-    fs::rename(from, to)?;
-    Ok(())
 }
 
 pub fn events_path(root: &Path, id: TaskId) -> PathBuf { session_dir(root, id).join("events.yaml") }
@@ -255,6 +251,24 @@ pub fn mark_processed(root: &Path, id: TaskId, path: &Path) -> anyhow::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_workspace_errors_with_hint_when_uninitialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban"); // never initialized
+        let err = ensure_workspace(&root).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no kanban workspace"), "got: {msg}");
+        assert!(msg.contains("kanban init"), "should hint at remedy, got: {msg}");
+    }
+
+    #[test]
+    fn ensure_workspace_ok_after_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        assert!(ensure_workspace(&root).is_ok());
+    }
 
     #[test]
     fn atomic_write_creates_parent_and_leaves_no_temp() {
@@ -323,16 +337,14 @@ mod tests {
     }
 
     #[test]
-    fn next_task_id_does_not_reuse_archived_ids() {
+    fn next_task_id_counts_archived_tasks() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         init_workspace(&root).unwrap();
-        save_task(&root, &sample_task(TaskId::new(1), "A")).unwrap();
-        save_task(&root, &sample_task(TaskId::new(2), "B")).unwrap();
-        archive_task(&root, TaskId::new(2)).unwrap();
-        archive_task(&root, TaskId::new(1)).unwrap();
-        // tasks/ is now empty but archive/ holds 1 and 2: the next id must clear
-        // both, or a new task collides with archived task (and session) dirs.
+        let mut t = sample_task(TaskId::new(2), "archived");
+        t.status.archived = true;
+        save_task(&root, &t).unwrap();
+        // archived tasks stay in tasks/, so their ids are never reused.
         assert_eq!(next_task_id(&root).unwrap(), TaskId::new(3));
     }
 
@@ -395,14 +407,16 @@ items:
     }
 
     #[test]
-    fn archive_task_moves_dir_out_of_tasks() {
+    fn remove_session_dir_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         init_workspace(&root).unwrap();
-        save_task(&root, &sample_task(TaskId::new(1), "A")).unwrap();
-        archive_task(&root, TaskId::new(1)).unwrap();
-        assert!(!root.join("tasks/task-0001").exists());
-        assert!(root.join("archive/task-0001").exists());
+        let id = TaskId::new(1);
+        fs::create_dir_all(session_dir(&root, id).join("hooks")).unwrap();
+        remove_session_dir(&root, id).unwrap();
+        assert!(!session_dir(&root, id).exists());
+        // a second call on a missing dir is a no-op, not an error
+        remove_session_dir(&root, id).unwrap();
     }
 
     #[test]

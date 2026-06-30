@@ -51,6 +51,10 @@ async fn sse_events(
 
 /// Bind and serve until the process is stopped. Used by `kanban daemon`.
 pub async fn serve(root: PathBuf, addr: std::net::SocketAddr) -> anyhow::Result<()> {
+    // Fail fast with a clear message rather than binding the port and serving
+    // ENOENT on every request (e.g. when launched from the wrong directory).
+    crate::controller::store::ensure_workspace(&root)?;
+
     let (tx, _rx) = broadcast::channel(64);
     // periodic reconcile: drain intake spools; notify subscribers on change
     {

@@ -13,8 +13,14 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 use std::io::Stdout;
+use std::time::Duration;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
+
+/// Spinner animation cadence — how often the `Working` spinner advances a frame.
+/// Only ticks while a worker is actually working (see `App::any_working`); the
+/// loop otherwise blocks on real events, so an idle board costs nothing.
+const SPINNER_TICK: Duration = Duration::from_millis(60);
 
 pub async fn run(base: String) -> anyhow::Result<()> {
     // Terminal setup.
@@ -70,7 +76,20 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
             terminal.draw(|f| crate::tui::ui::render(f, &app, screen))?;
         }
 
+        // Animate the spinner only while a worker is working; otherwise this arm
+        // parks forever and the loop blocks on real events (no idle redraws).
+        let animating = !matches!(app.mode(), Mode::Terminal) && app.any_working();
+
         tokio::select! {
+            _ = async {
+                if animating {
+                    tokio::time::sleep(SPINNER_TICK).await
+                } else {
+                    std::future::pending::<()>().await
+                }
+            } => {
+                app.advance_spinner();
+            }
             maybe = input.next() => {
                 match maybe {
                     Some(Ok(Event::Key(key))) => {

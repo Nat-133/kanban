@@ -19,10 +19,13 @@ pub fn apply(root: &Path, intent: Intent) -> anyhow::Result<Response> {
         }
         Intent::GetBoard => {
             let board = store::load_board_checked(root)?;
-            let tasks = store::load_all_tasks(root)?;
+            let tasks: Vec<_> = store::load_all_tasks(root)?
+                .into_iter()
+                .filter(|t| !t.status.archived)
+                .collect();
             let mut sessions = Vec::new();
             for s in store::load_all_sessions(root)? {
-                let phase = crate::controller::derive::derive(&store::load_events(&store::session_dir(root, s.spec.task_ref))?);
+                let phase = crate::controller::events::session_phase(root, s.spec.task_ref)?;
                 sessions.push(crate::model::proto::SessionView {
                     task: s.spec.task_ref,
                     session_name: s.spec.session_name.clone().unwrap_or_default(),
@@ -147,6 +150,26 @@ fn reorder_card(root: &Path, task_id: TaskId, position: usize) -> anyhow::Result
 }
 
 fn archive(root: &Path, task_id: TaskId, launcher: &dyn handoff::Launcher) -> anyhow::Result<Response> {
+    let mut task = match store::load_task(root, task_id) {
+        Ok(t) => t,
+        Err(_) => return Ok(Response::Error { message: format!("unknown task: {task_id}") }),
+    };
+    // Idempotent: archiving an already-archived task is a no-op.
+    if task.status.archived {
+        return Ok(Response::Ok { task: Some(task_id) });
+    }
+    // Tear down any worker: kill its terminal session and drop its runtime state
+    // so the reconcile loop stops seeing it.
+    if let Some(session) = store::load_session(root, task_id)? {
+        if let Some(name) = session.spec.session_name.as_deref() {
+            launcher.kill(name);
+        }
+    }
+    store::remove_session_dir(root, task_id)?;
+    // Flag the task archived (kept on disk, hidden from the board)…
+    task.status.archived = true;
+    store::save_task(root, &task)?;
+    // …and take its card off the board.
     let mut raw: RawBoard = store::load_board_checked(root)?.into();
     remove_card(&mut raw, task_id);
     let board = match Board::try_from(raw) {
@@ -154,17 +177,6 @@ fn archive(root: &Path, task_id: TaskId, launcher: &dyn handoff::Launcher) -> an
         Err(e) => return Ok(Response::Error { message: e.to_string() }),
     };
     store::save_board(root, &board)?;
-    // Tear down any worker: kill its terminal session, then take the session
-    // workspace out of the live `sessions/` tree alongside the task. Otherwise
-    // the worker keeps running and the reconcile loop can resurrect a phantom
-    // card for the now-archived task.
-    if let Some(session) = store::load_session(root, task_id)? {
-        if let Some(name) = session.spec.session_name.as_deref() {
-            launcher.kill(name);
-        }
-    }
-    store::archive_task(root, task_id)?;
-    store::archive_session_dir(root, task_id)?;
     Ok(Response::Ok { task: Some(task_id) })
 }
 
@@ -184,10 +196,10 @@ mod tests {
     #[test]
     fn create_task_allocates_id_and_places_on_board() {
         let d = setup(); let r = root(&d);
-        let resp = apply(&r, Intent::CreateTask { title: "First".into(), summary: "s".into(), column: col("inbox") }).unwrap();
+        let resp = apply(&r, Intent::CreateTask { title: "First".into(), summary: "s".into(), column: col("todo") }).unwrap();
         assert_eq!(resp, Response::Ok { task: Some(TaskId::new(1)) });
         let board = crate::controller::store::load_board(&r).unwrap();
-        assert_eq!(board.cards().get(&col("inbox")).unwrap(), &vec![TaskId::new(1)]);
+        assert_eq!(board.cards().get(&col("todo")).unwrap(), &vec![TaskId::new(1)]);
         assert!(crate::controller::store::load_task(&r, TaskId::new(1)).is_ok());
     }
 
@@ -201,7 +213,7 @@ mod tests {
     #[test]
     fn get_board_returns_snapshot_with_tasks() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("inbox") }).unwrap();
+        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
         match apply(&r, Intent::GetBoard).unwrap() {
             Response::Snapshot { tasks, .. } => assert_eq!(tasks.len(), 1),
             o => panic!("expected snapshot, got {o:?}"),
@@ -217,9 +229,9 @@ mod tests {
     #[test]
     fn get_board_includes_sessions_with_phase() {
         let dir = setup(); let r = root(&dir);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("inbox") }).unwrap();
+        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
         crate::controller::handoff::handoff(&r, TaskId::new(1), "claude", &NoLaunch).unwrap();
-        crate::controller::events::record_intake(&r, TaskId::new(1), "notification", "{\"notification_type\":\"permission_prompt\"}").unwrap();
+        crate::controller::events::record_state(&r, TaskId::new(1), "notification", "{\"notification_type\":\"permission_prompt\"}").unwrap();
         crate::controller::events::ingest_session(&r, TaskId::new(1)).unwrap();
         match apply(&r, Intent::GetBoard).unwrap() {
             Response::Snapshot { sessions, .. } => {
@@ -235,7 +247,7 @@ mod tests {
     #[test]
     fn edit_task_updates_fields() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("inbox") }).unwrap();
+        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
         apply(&r, Intent::EditTask { task: TaskId::new(1), title: Some("B".into()), summary: None }).unwrap();
         let t = crate::controller::store::load_task(&r, TaskId::new(1)).unwrap();
         assert_eq!(t.spec.title, "B");
@@ -252,17 +264,17 @@ mod tests {
     #[test]
     fn move_card_moves_between_columns() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("inbox") }).unwrap();
+        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
         apply(&r, Intent::MoveCard { task: TaskId::new(1), to_column: col("doing"), position: None }).unwrap();
         let board = crate::controller::store::load_board(&r).unwrap();
-        assert!(board.cards().get(&col("inbox")).unwrap().is_empty());
+        assert!(board.cards().get(&col("todo")).unwrap().is_empty());
         assert_eq!(board.cards().get(&col("doing")).unwrap(), &vec![TaskId::new(1)]);
     }
 
     #[test]
     fn move_card_to_unknown_column_errors() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("inbox") }).unwrap();
+        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
         let resp = apply(&r, Intent::MoveCard { task: TaskId::new(1), to_column: col("ghost"), position: None }).unwrap();
         assert!(matches!(resp, Response::Error { .. }));
     }
@@ -270,12 +282,12 @@ mod tests {
     #[test]
     fn reorder_card_within_column() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("inbox") }).unwrap();
-        apply(&r, Intent::CreateTask { title: "B".into(), summary: "s".into(), column: col("inbox") }).unwrap();
+        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
+        apply(&r, Intent::CreateTask { title: "B".into(), summary: "s".into(), column: col("todo") }).unwrap();
         // inbox = [task-0001, task-0002]; move task-0002 to position 0
         apply(&r, Intent::ReorderCard { task: TaskId::new(2), position: 0 }).unwrap();
         let board = crate::controller::store::load_board(&r).unwrap();
-        assert_eq!(board.cards().get(&col("inbox")).unwrap(), &vec![TaskId::new(2), TaskId::new(1)]);
+        assert_eq!(board.cards().get(&col("todo")).unwrap(), &vec![TaskId::new(2), TaskId::new(1)]);
     }
 
     #[derive(Default)]
@@ -288,9 +300,9 @@ mod tests {
     }
 
     #[test]
-    fn archive_kills_session_and_moves_session_dir() {
+    fn archive_flags_task_kills_session_and_removes_session_dir() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "".into(), column: col("inbox") }).unwrap();
+        apply(&r, Intent::CreateTask { title: "A".into(), summary: "".into(), column: col("todo") }).unwrap();
         let id = TaskId::new(1);
         // hand off (fake launcher) so a session.yaml + sessions/ dir exist
         handoff::handoff(&r, id, "claude", &FakeLauncher::default()).unwrap();
@@ -299,20 +311,40 @@ mod tests {
         let fake = FakeLauncher::default();
         archive(&r, id, &fake).unwrap();
 
-        // session taken out of the live sessions/ tree (no phantom resurrection)…
-        assert!(!store::session_dir(&r, id).exists(), "session dir must leave sessions/");
-        assert!(r.join("archive/task-0001/session").exists(), "session dir should be archived");
-        // …and the terminal session asked to be torn down
+        // task kept on disk but flagged archived, card gone, session torn down
+        assert!(store::load_task(&r, id).unwrap().status.archived);
+        let board = store::load_board(&r).unwrap();
+        assert!(board.cards().values().all(|v| v.is_empty()));
+        assert!(!store::session_dir(&r, id).exists(), "session dir should be removed");
         assert_eq!(&*fake.killed.lock().unwrap(), &["kanban-task-0001".to_string()]);
     }
 
     #[test]
-    fn archive_removes_card_and_task() {
+    fn archived_task_is_hidden_from_snapshot() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("inbox") }).unwrap();
+        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
         apply(&r, Intent::ArchiveTask { task: TaskId::new(1) }).unwrap();
-        let board = crate::controller::store::load_board(&r).unwrap();
-        assert!(board.cards().values().all(|v| v.is_empty()));
-        assert!(crate::controller::store::load_task(&r, TaskId::new(1)).is_err());
+        // still on disk…
+        assert!(store::load_task(&r, TaskId::new(1)).unwrap().status.archived);
+        // …but absent from the board and the snapshot's task list
+        match apply(&r, Intent::GetBoard).unwrap() {
+            Response::Snapshot { board, tasks, .. } => {
+                assert!(board.cards().values().all(|v| v.is_empty()));
+                assert!(tasks.is_empty());
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn archive_is_idempotent() {
+        let d = setup(); let r = root(&d);
+        apply(&r, Intent::CreateTask { title: "A".into(), summary: "".into(), column: col("todo") }).unwrap();
+        let id = TaskId::new(1);
+        let fake = FakeLauncher::default();
+        archive(&r, id, &fake).unwrap();
+        // second call must not error and must leave the same end state
+        archive(&r, id, &fake).unwrap();
+        assert!(store::load_task(&r, id).unwrap().status.archived);
     }
 }

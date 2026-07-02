@@ -36,7 +36,7 @@ pub fn load_config(root: &Path) -> anyhow::Result<Config> {
 }
 
 fn default_config_yaml() -> &'static str {
-    "agents:\n  baseDirs:\n    - ~/vcs/*\nworkers:\n  claude:\n    command: claude\n    args:\n      - --add-dir\n      - .kanban/sessions/{task_id}\n    workdir: \"{repo}\"\n    terminal:\n      type: tmux\n      sessionName: kanban-{task_id}\n"
+    "agents:\n  baseDirs:\n    - ~/vcs/*\nworkers:\n  claude:\n    command: claude\n    args:\n      - --add-dir\n      - .kanban/sessions/{task_id}/work\n    workdir: \"{repo}\"\n    terminal:\n      type: tmux\n      sessionName: kanban-{task_id}\n"
 }
 
 pub fn load_board(root: &Path) -> anyhow::Result<Board> {
@@ -92,16 +92,6 @@ pub fn next_task_id(root: &Path) -> anyhow::Result<TaskId> {
         .ok_or_else(|| anyhow::anyhow!("task id space exhausted"))
 }
 
-pub fn load_events(session_dir: &Path) -> anyhow::Result<Vec<WorkerEvent>> {
-    let path = session_dir.join("events.yaml");
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let text = fs::read_to_string(&path)?;
-    let list: WorkerEventList = serde_yml::from_str(&text)?;
-    Ok(list.items)
-}
-
 pub fn tasks_dir(root: &Path) -> PathBuf { root.join("tasks") }
 pub fn task_dir(root: &Path, id: TaskId) -> PathBuf { tasks_dir(root).join(id.to_string()) }
 fn task_file(root: &Path, id: TaskId) -> PathBuf { task_dir(root, id).join("task.yaml") }
@@ -121,7 +111,7 @@ pub fn init_workspace(root: &Path) -> anyhow::Result<()> {
 }
 
 fn default_board() -> RawBoard {
-    let columns = ["inbox", "ready", "doing", "blocked", "waiting-human", "review", "done"];
+    let columns = ["todo", "doing", "done"];
     RawBoard {
         api_version: ApiVersion::V1Alpha1,
         kind: BoardKind::Board,
@@ -214,38 +204,24 @@ pub fn load_all_tasks(root: &Path) -> anyhow::Result<Vec<Task>> {
     Ok(out)
 }
 
-pub fn events_path(root: &Path, id: TaskId) -> PathBuf { session_dir(root, id).join("events.yaml") }
+/// The worker's current-state file. Single source of a session's live phase:
+/// the hook overwrites it with the latest tracked event; the controller only
+/// ever reads it. No history is kept here (see the activity log for that).
+pub fn state_path(root: &Path, id: TaskId) -> PathBuf { session_dir(root, id).join("state.yaml") }
 
-pub fn append_worker_event(root: &Path, id: TaskId, event: &WorkerEvent) -> anyhow::Result<()> {
-    let mut items = load_events(&session_dir(root, id)).unwrap_or_default();
-    items.push(event.clone());
-    let list = WorkerEventList {
-        api_version: Some(ApiVersion::V1Alpha1),
-        kind: Some(WorkerEventListKind::WorkerEventList),
-        metadata: Some(Metadata { name: format!("{id}-events"), creation_timestamp: None, labels: Default::default() }),
-        items,
-    };
-    atomic_write(&events_path(root, id), &serde_yml::to_string(&list)?)
+/// Overwrite a session's state file with its latest worker event.
+pub fn save_state(root: &Path, id: TaskId, event: &WorkerEvent) -> anyhow::Result<()> {
+    atomic_write(&state_path(root, id), &serde_yml::to_string(event)?)
 }
 
-/// Intake payload files for a session, sorted by name (ingest order).
-pub fn list_intake(root: &Path, id: TaskId) -> anyhow::Result<Vec<PathBuf>> {
-    let dir = session_dir(root, id).join("hooks/intake");
-    let mut out = Vec::new();
-    if dir.exists() {
-        for e in fs::read_dir(&dir)? { out.push(e?.path()); }
+/// Read a session's current state, if it has one yet. A session that has never
+/// emitted a tracked event has no state file.
+pub fn load_state(root: &Path, id: TaskId) -> anyhow::Result<Option<WorkerEvent>> {
+    let p = state_path(root, id);
+    if !p.exists() {
+        return Ok(None);
     }
-    out.sort();
-    Ok(out)
-}
-
-/// Move a processed intake file into hooks/processed/ (once-only via rename).
-pub fn mark_processed(root: &Path, id: TaskId, path: &Path) -> anyhow::Result<()> {
-    let processed = session_dir(root, id).join("hooks/processed");
-    fs::create_dir_all(&processed)?;
-    let name = path.file_name().ok_or_else(|| anyhow::anyhow!("intake path has no file name"))?;
-    fs::rename(path, processed.join(name))?;
-    Ok(())
+    Ok(Some(serde_yml::from_str(&fs::read_to_string(&p)?)?))
 }
 
 #[cfg(test)]
@@ -293,10 +269,10 @@ mod tests {
             },
             spec: RawBoardSpec {
                 columns: vec![Column {
-                    id: "inbox".parse().unwrap(),
+                    id: "todo".parse().unwrap(),
                     title: "Inbox".into(),
                 }],
-                cards: [("inbox".parse().unwrap(), vec![TaskId::new(1)])]
+                cards: [("todo".parse().unwrap(), vec![TaskId::new(1)])]
                     .into_iter()
                     .collect(),
             },
@@ -349,29 +325,43 @@ mod tests {
     }
 
     #[test]
-    fn load_events_empty_when_missing() {
+    fn load_state_is_none_when_missing() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load_events(dir.path()).unwrap().is_empty());
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        assert!(load_state(&root, TaskId::new(1)).unwrap().is_none());
     }
 
     #[test]
-    fn load_events_parses_in_order() {
+    fn state_saves_and_loads_back() {
         let dir = tempfile::tempdir().unwrap();
-        let yaml = "\
-metadata:
-  name: s
-items:
-  - {type: started, source: controller, observedAt: \"2026-06-17T10:00:00Z\"}
-  - {type: human_input_required, source: h, notificationType: idle_prompt, observedAt: \"2026-06-17T10:30:00Z\"}
-";
-        fs::write(dir.path().join("events.yaml"), yaml).unwrap();
-        let e = load_events(dir.path()).unwrap();
-        assert_eq!(e.len(), 2);
-        assert_eq!(e[0].kind, WorkerEventKind::Started);
-        assert_eq!(
-            e[1].kind,
-            WorkerEventKind::HumanInputRequired(Notification::IdlePrompt)
-        );
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        let id = TaskId::new(1);
+        let ev = WorkerEvent {
+            kind: WorkerEventKind::HumanInputRequired(Notification::IdlePrompt),
+            source: "claude-code-hook".into(),
+            observed_at: time::OffsetDateTime::UNIX_EPOCH,
+            payload_ref: None,
+        };
+        save_state(&root, id, &ev).unwrap();
+        assert_eq!(load_state(&root, id).unwrap().unwrap(), ev);
+    }
+
+    #[test]
+    fn save_state_overwrites_rather_than_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        let id = TaskId::new(1);
+        let started = WorkerEvent { kind: WorkerEventKind::Started, source: "h".into(),
+            observed_at: time::OffsetDateTime::UNIX_EPOCH, payload_ref: None };
+        let idle = WorkerEvent { kind: WorkerEventKind::HumanInputRequired(Notification::IdlePrompt),
+            source: "h".into(), observed_at: time::OffsetDateTime::UNIX_EPOCH, payload_ref: None };
+        save_state(&root, id, &started).unwrap();
+        save_state(&root, id, &idle).unwrap();
+        // only the latest event survives — the state file is current-state, not a log
+        assert_eq!(load_state(&root, id).unwrap().unwrap(), idle);
     }
 
     #[test]
@@ -426,36 +416,6 @@ items:
         init_workspace(&root).unwrap();
         let cfg = load_config(&root).unwrap();
         assert!(cfg.workers.contains_key("claude"));
-    }
-
-    #[test]
-    fn append_worker_event_accumulates() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".kanban");
-        init_workspace(&root).unwrap();
-        let id = TaskId::new(1);
-        std::fs::create_dir_all(session_dir(&root, id)).unwrap();
-        let ev = WorkerEvent { kind: WorkerEventKind::Started, source: "controller".into(),
-            observed_at: time::OffsetDateTime::UNIX_EPOCH, payload_ref: None };
-        append_worker_event(&root, id, &ev).unwrap();
-        append_worker_event(&root, id, &ev).unwrap();
-        assert_eq!(load_events(&session_dir(&root, id)).unwrap().len(), 2);
-    }
-
-    #[test]
-    fn drain_intake_moves_files_to_processed() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".kanban");
-        init_workspace(&root).unwrap();
-        let id = TaskId::new(1);
-        let intake = session_dir(&root, id).join("hooks/intake");
-        std::fs::create_dir_all(&intake).unwrap();
-        std::fs::write(intake.join("0001.json"), "{}").unwrap();
-        let files = list_intake(&root, id).unwrap();
-        assert_eq!(files.len(), 1);
-        mark_processed(&root, id, &files[0]).unwrap();
-        assert!(!files[0].exists());
-        assert!(session_dir(&root, id).join("hooks/processed/0001.json").exists());
     }
 
     fn sample_task(id: TaskId, title: &str) -> Task {

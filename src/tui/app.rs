@@ -41,6 +41,8 @@ pub struct App {
     filter: String,
     editing: Option<TaskId>,
     pub status: Option<String>,
+    /// Render-tick counter driving the `Working` spinner animation.
+    tick: u64,
 }
 
 impl App {
@@ -54,7 +56,28 @@ impl App {
             filter: String::new(),
             editing: None,
             status: None,
+            tick: 0,
         }
+    }
+
+    /// The current spinner tick; the renderer indexes its frame table with this.
+    pub fn spinner_tick(&self) -> u64 {
+        self.tick
+    }
+
+    /// Advance the spinner by one frame. Called on the render-loop's animation tick.
+    pub fn advance_spinner(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+    }
+
+    /// True when at least one worker is actively working — i.e. there's a spinner
+    /// on screen and the render loop should keep ticking. When false the loop can
+    /// idle until a real event arrives.
+    pub fn any_working(&self) -> bool {
+        self.snapshot
+            .sessions
+            .iter()
+            .any(|s| s.phase == crate::model::Phase::Working)
     }
 
     pub fn snapshot(&self) -> &Snapshot {
@@ -423,9 +446,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "First".into(), summary: "".into(), column: "inbox".parse().unwrap() }).unwrap();
-        apply(&root, Intent::CreateTask { title: "Second".into(), summary: "".into(), column: "inbox".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { title: "First".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { title: "Second".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
         Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap(), sessions: vec![] }
+    }
+
+    #[test]
+    fn any_working_only_with_a_working_session() {
+        use crate::model::proto::SessionView;
+        use crate::model::Phase;
+        assert!(!App::new(snap()).any_working()); // no sessions
+        let mut idle = snap();
+        idle.sessions = vec![SessionView { task: TaskId::new(1), session_name: "s".into(), phase: Phase::Idle, needs_human_input: true }];
+        assert!(!App::new(idle).any_working()); // idle is not working
+        let mut working = snap();
+        working.sessions = vec![SessionView { task: TaskId::new(1), session_name: "s".into(), phase: Phase::Working, needs_human_input: false }];
+        assert!(App::new(working).any_working());
+    }
+
+    #[test]
+    fn advance_spinner_increments_tick() {
+        let mut app = App::new(snap());
+        assert_eq!(app.spinner_tick(), 0);
+        app.advance_spinner();
+        app.advance_spinner();
+        assert_eq!(app.spinner_tick(), 2);
     }
 
     #[test]
@@ -467,12 +512,12 @@ mod tests {
 
     #[test]
     fn shift_l_emits_move_card_intent() {
-        let mut app = App::new(snap()); // selected task-0001 in inbox (col 0)
+        let mut app = App::new(snap()); // selected task-0001 in todo (col 0)
         let action = app.on_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT));
         match action {
             Action::Send(Intent::MoveCard { task, to_column, .. }) => {
                 assert_eq!(task, TaskId::new(1));
-                assert_eq!(to_column.as_str(), "ready");
+                assert_eq!(to_column.as_str(), "doing"); // todo -> doing (next column)
             }
             o => panic!("expected MoveCard, got {o:?}"),
         }
@@ -501,7 +546,7 @@ mod tests {
         match action {
             Action::Send(Intent::CreateTask { title, column, .. }) => {
                 assert_eq!(title, "Hi");
-                assert_eq!(column.as_str(), "inbox");
+                assert_eq!(column.as_str(), "todo");
             }
             o => panic!("expected CreateTask, got {o:?}"),
         }

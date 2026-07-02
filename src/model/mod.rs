@@ -247,6 +247,9 @@ pub struct Context {
 pub struct TaskStatus {
     #[serde(default)]
     pub worker_session_ref: Option<String>,
+    /// When true the task is archived: kept on disk but hidden from the board.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
     #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<OffsetDateTime>,
 }
@@ -515,7 +518,7 @@ labels:
 
     #[test]
     fn column_id_rejects_empty() {
-        assert!("inbox".parse::<ColumnId>().is_ok());
+        assert!("todo".parse::<ColumnId>().is_ok());
         assert!("".parse::<ColumnId>().is_err());
         assert!(" ".parse::<ColumnId>().is_err());
     }
@@ -538,38 +541,38 @@ labels:
 
     #[test]
     fn valid_board_parses() {
-        let b = Board::try_from(raw_board(&[("inbox", &["task-0001"]), ("doing", &[])], &["inbox", "doing"])).unwrap();
+        let b = Board::try_from(raw_board(&[("todo", &["task-0001"]), ("doing", &[])], &["todo", "doing"])).unwrap();
         assert_eq!(b.columns().len(), 2);
-        assert_eq!(b.cards().get(&"inbox".parse().unwrap()).unwrap(), &vec![TaskId::new(1)]);
+        assert_eq!(b.cards().get(&"todo".parse().unwrap()).unwrap(), &vec![TaskId::new(1)]);
     }
 
     #[test]
     fn card_in_unknown_column_is_rejected() {
-        let err = Board::try_from(raw_board(&[("ghost", &["task-0001"])], &["inbox"])).unwrap_err();
+        let err = Board::try_from(raw_board(&[("ghost", &["task-0001"])], &["todo"])).unwrap_err();
         assert!(matches!(err, BoardError::UnknownColumn { .. }));
     }
 
     #[test]
     fn task_in_two_columns_is_rejected() {
-        let raw = raw_board(&[("inbox", &["task-0001"]), ("doing", &["task-0001"])], &["inbox", "doing"]);
+        let raw = raw_board(&[("todo", &["task-0001"]), ("doing", &["task-0001"])], &["todo", "doing"]);
         assert!(matches!(Board::try_from(raw).unwrap_err(), BoardError::DuplicateTask(_)));
     }
 
     #[test]
     fn duplicate_column_is_rejected() {
-        let raw = raw_board(&[], &["inbox", "inbox"]);
+        let raw = raw_board(&[], &["todo", "todo"]);
         assert!(matches!(Board::try_from(raw).unwrap_err(), BoardError::DuplicateColumn(_)));
     }
 
     #[test]
     fn task_listed_twice_in_one_column_is_rejected() {
-        let raw = raw_board(&[("inbox", &["task-0001", "task-0001"])], &["inbox"]);
+        let raw = raw_board(&[("todo", &["task-0001", "task-0001"])], &["todo"]);
         assert!(matches!(Board::try_from(raw).unwrap_err(), BoardError::DuplicateTask(_)));
     }
 
     #[test]
     fn board_round_trips_through_yaml() {
-        let b = Board::try_from(raw_board(&[("inbox", &["task-0001"])], &["inbox"])).unwrap();
+        let b = Board::try_from(raw_board(&[("todo", &["task-0001"])], &["todo"])).unwrap();
         let y = serde_yml::to_string(&b).unwrap();
         let b2: Board = serde_yml::from_str(&y).unwrap();
         assert_eq!(b, b2);

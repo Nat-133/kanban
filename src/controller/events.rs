@@ -3,53 +3,26 @@ use crate::model::{Notification, Phase, TaskId, WorkerEvent, WorkerEventKind};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// One captured hook event awaiting ingestion. `payload` is Claude's raw event JSON.
+/// One captured hook event. `payload` is Claude's raw event JSON. Used only as an
+/// in-memory parse target while mapping a hook firing to a worker event; it is
+/// never persisted (the session's `state.yaml` holds the mapped event instead).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntakePayload {
     pub event: String,
     pub payload: serde_json::Value,
 }
 
-fn intake_dir(root: &Path, id: TaskId) -> std::path::PathBuf {
-    store::session_dir(root, id).join("hooks/intake")
-}
-
-/// Next zero-padded intake filename (count-based; hooks from one session fire serially).
-fn next_intake_name(dir: &Path) -> String {
-    let mut max = 0u32;
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            if let Some(stem) = e.path().file_stem().and_then(|s| s.to_str()) {
-                if let Ok(n) = stem.parse::<u32>() {
-                    max = max.max(n);
-                }
-            }
-        }
-    }
-    format!("{:04}.json", max + 1)
-}
-
-/// Write one intake payload. `raw_payload` is Claude's stdin JSON (stored as a string if not valid JSON).
-pub fn record_intake(root: &Path, id: TaskId, event: &str, raw_payload: &str) -> anyhow::Result<()> {
-    let dir = intake_dir(root, id);
-    std::fs::create_dir_all(&dir)?;
-    let payload: serde_json::Value = serde_json::from_str(raw_payload)
-        .unwrap_or_else(|_| serde_json::Value::String(raw_payload.to_string()));
-    let item = IntakePayload {
-        event: event.to_string(),
-        payload,
-    };
-    let name = next_intake_name(&dir);
-    store::atomic_write(&dir.join(name), &serde_json::to_string_pretty(&item)?)?;
-    Ok(())
-}
-
-/// Map a captured intake item to a worker event. None = not tracked (e.g. a
-/// non-permission/idle Notification like auth_success).
-fn to_event(item: &IntakePayload, payload_ref: String) -> Option<WorkerEvent> {
+/// Map a captured hook firing to a worker event. None = not tracked (e.g. a
+/// non-permission/idle Notification like auth_success), in which case the
+/// session's state is left untouched.
+fn to_event(item: &IntakePayload) -> Option<WorkerEvent> {
     let kind = match item.event.as_str() {
         "session-start" => WorkerEventKind::Started,
-        "user-prompt-submit" | "stop" => WorkerEventKind::Working,
+        "user-prompt-submit" => WorkerEventKind::Working,
+        // Stop fires when claude finishes its turn and hands control back to the
+        // human — it is waiting for a response, not working. Treat it as idle so
+        // the card flips to the warning, not the spinner.
+        "stop" => WorkerEventKind::HumanInputRequired(Notification::IdlePrompt),
         "session-end" => WorkerEventKind::Completed,
         "stop-failure" => WorkerEventKind::Failed,
         "notification" => match item.payload.get("notification_type").and_then(|v| v.as_str()) {
@@ -63,61 +36,104 @@ fn to_event(item: &IntakePayload, payload_ref: String) -> Option<WorkerEvent> {
         kind,
         source: "claude-code-hook".to_string(),
         observed_at: time::OffsetDateTime::now_utc(),
-        payload_ref: Some(payload_ref),
+        payload_ref: None,
     })
 }
 
-/// Board column for a derived phase. None = leave the card where it is.
+/// Record a hook firing into the session's state file, overwriting the previous
+/// state. `raw_payload` is Claude's stdin JSON (treated as a bare string if not
+/// valid JSON). Returns true when the event was tracked and the state changed —
+/// the caller uses this to decide whether to wake the controller. Untracked
+/// firings leave the existing state in place and return false.
+pub fn record_state(root: &Path, id: TaskId, event: &str, raw_payload: &str) -> anyhow::Result<bool> {
+    let payload: serde_json::Value = serde_json::from_str(raw_payload)
+        .unwrap_or_else(|_| serde_json::Value::String(raw_payload.to_string()));
+    let item = IntakePayload { event: event.to_string(), payload };
+    match to_event(&item) {
+        Some(ev) => {
+            store::save_state(root, id, &ev)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// The phase a session is currently in, derived from its state file. A session
+/// with no state file yet is `Pending`.
+pub fn session_phase(root: &Path, id: TaskId) -> anyhow::Result<Phase> {
+    let events: Vec<WorkerEvent> = store::load_state(root, id)?.into_iter().collect();
+    Ok(crate::controller::derive::derive(&events))
+}
+
+/// Board column for a derived phase. The board has only the workflow stages
+/// (todo / doing / done); the card's *icon* conveys the live agent state
+/// (spinner while working, warning when it needs a human). So every active
+/// phase maps to `doing` and only a clean completion advances to `done`.
+/// None = leave the card where it is.
 fn phase_column(phase: Phase) -> Option<&'static str> {
     match phase {
-        Phase::Working => Some("doing"),
-        Phase::WaitingHuman => Some("blocked"),
-        Phase::Idle => Some("waiting-human"),
-        Phase::Completed | Phase::Failed => Some("review"),
+        Phase::Working | Phase::WaitingHuman | Phase::Idle | Phase::Failed => Some("doing"),
+        Phase::Completed => Some("done"),
         Phase::Pending => None,
     }
 }
 
-/// Drain a session's intake, append tracked events, and move the card to match the
-/// derived phase. Returns true if any tracked event was recorded.
+/// Re-read a session's state and move its card to match. Level-triggered and
+/// idempotent: returns true only when the card actually changed column, so
+/// repeated reconciles/wakes don't spuriously report change.
 pub fn ingest_session(root: &Path, id: TaskId) -> anyhow::Result<bool> {
-    let intake = store::list_intake(root, id)?;
-    if intake.is_empty() {
+    // Never move an archived (or vanished) task's card onto the board: a lingering
+    // session firing events would otherwise resurrect it.
+    let archived = store::load_task(root, id).map(|t| t.status.archived).unwrap_or(true);
+    if archived {
         return Ok(false);
     }
-    let mut any = false;
-    for path in intake {
-        let text = std::fs::read_to_string(&path)?;
-        let item: IntakePayload = serde_json::from_str(&text)?;
-        let processed_ref = format!("hooks/processed/{}", path.file_name().unwrap().to_string_lossy());
-        if let Some(event) = to_event(&item, processed_ref) {
-            store::append_worker_event(root, id, &event)?;
-            any = true;
-        }
-        store::mark_processed(root, id, &path)?;
+    let phase = session_phase(root, id)?;
+    match phase_column(phase) {
+        Some(col) => move_card_to(root, id, col),
+        None => Ok(false),
     }
-    if any {
-        let phase = crate::controller::derive::derive(&store::load_events(&store::session_dir(root, id))?);
-        if let Some(col) = phase_column(phase) {
-            move_card_to(root, id, col)?;
-        }
-    }
-    Ok(any)
 }
 
-fn move_card_to(root: &Path, id: TaskId, column: &str) -> anyhow::Result<()> {
+/// Move `id` to `column` if it isn't already there. Returns true iff the board changed.
+fn move_card_to(root: &Path, id: TaskId, column: &str) -> anyhow::Result<bool> {
     use crate::model::{Board, RawBoard};
-    let mut raw: RawBoard = store::load_board(root)?.into();
     let col = column.parse().map_err(|_| anyhow::anyhow!("bad column id: {column}"))?;
+    let mut raw: RawBoard = store::load_board(root)?.into();
+    // Already in the target column with nothing else to do -> no-op.
+    if raw.spec.cards.get(&col).is_some_and(|v| v.contains(&id)) {
+        return Ok(false);
+    }
     for v in raw.spec.cards.values_mut() {
         v.retain(|t| *t != id);
     }
     raw.spec.cards.entry(col).or_default().push(id);
     let board = Board::try_from(raw).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    store::save_board(root, &board)
+    store::save_board(root, &board)?;
+    Ok(true)
 }
 
-/// Drain every session's intake. Returns true if anything changed.
+/// A hash of everything the UI can observe: the board's card layout plus every
+/// session's derived phase. The reconcile loop broadcasts whenever this changes,
+/// so phase-only transitions (e.g. working -> idle, both in `doing`) still push an
+/// update even though no card moved column.
+pub fn observable_fingerprint(root: &Path) -> anyhow::Result<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // board card layout (deterministic: columns are ordered, cards is a BTreeMap)
+    serde_yml::to_string(&store::load_board(root)?)?.hash(&mut h);
+    // each session's phase, in a stable order
+    let mut sessions = store::load_all_sessions(root)?;
+    sessions.sort_by_key(|s| s.spec.task_ref.as_u32());
+    for s in &sessions {
+        s.spec.task_ref.as_u32().hash(&mut h);
+        format!("{:?}", session_phase(root, s.spec.task_ref)?).hash(&mut h);
+    }
+    Ok(h.finish())
+}
+
+/// Re-read every session's state and reconcile its card. Returns true if any
+/// card moved.
 pub fn reconcile_all(root: &Path) -> anyhow::Result<bool> {
     let sessions = root.join("sessions");
     let mut any = false;
@@ -138,98 +154,190 @@ mod tests {
     use crate::model::TaskId;
 
     #[test]
-    fn record_writes_intake_payload() {
+    fn record_state_writes_mapped_event_for_tracked_firing() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         crate::controller::store::init_workspace(&root).unwrap();
         let id = TaskId::new(1);
-        std::fs::create_dir_all(root.join("sessions/task-0001/hooks/intake")).unwrap();
 
-        record_intake(&root, id, "notification", "{\"notification_type\":\"permission_prompt\"}").unwrap();
-        record_intake(&root, id, "stop", "{}").unwrap();
-
-        let intake = root.join("sessions/task-0001/hooks/intake");
-        let mut files: Vec<_> = std::fs::read_dir(&intake).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
-        files.sort();
-        assert_eq!(files.len(), 2);
-        let first = std::fs::read_to_string(intake.join(&files[0])).unwrap();
-        assert!(first.contains("notification"));
-        assert!(first.contains("permission_prompt"));
+        let tracked = record_state(&root, id, "notification", "{\"notification_type\":\"permission_prompt\"}").unwrap();
+        assert!(tracked);
+        let state = store::load_state(&root, id).unwrap().unwrap();
+        assert_eq!(state.kind, WorkerEventKind::HumanInputRequired(Notification::PermissionPrompt));
     }
 
     #[test]
-    fn ingest_permission_prompt_moves_card_to_blocked() {
-        use crate::controller::{store, apply::apply};
+    fn record_state_overwrites_previous_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        let id = TaskId::new(1);
+        record_state(&root, id, "session-start", "{}").unwrap();
+        record_state(&root, id, "notification", "{\"notification_type\":\"idle_prompt\"}").unwrap();
+        // only the latest tracked event is retained
+        let state = store::load_state(&root, id).unwrap().unwrap();
+        assert_eq!(state.kind, WorkerEventKind::HumanInputRequired(Notification::IdlePrompt));
+    }
+
+    #[test]
+    fn record_state_ignores_untracked_firing_and_keeps_prior_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        let id = TaskId::new(1);
+        record_state(&root, id, "user-prompt-submit", "{}").unwrap(); // Working
+        let tracked = record_state(&root, id, "notification", "{\"notification_type\":\"auth_success\"}").unwrap();
+        assert!(!tracked); // untracked -> caller should not wake
+        // prior Working state must survive an untracked firing
+        assert_eq!(store::load_state(&root, id).unwrap().unwrap().kind, WorkerEventKind::Working);
+    }
+
+    #[test]
+    fn ingest_permission_prompt_keeps_card_in_doing() {
+        use crate::controller::apply::apply;
         use crate::model::proto::Intent;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "inbox".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
         let id = TaskId::new(1);
-        record_intake(&root, id, "notification", "{\"notification_type\":\"permission_prompt\"}").unwrap();
+        record_state(&root, id, "notification", "{\"notification_type\":\"permission_prompt\"}").unwrap();
 
         let changed = ingest_session(&root, id).unwrap();
         assert!(changed);
-        assert_eq!(store::load_events(&store::session_dir(&root, id)).unwrap().len(), 1);
+        // needs-human is an in-progress state -> stays in doing; the warning icon
+        // (not the column) signals it needs attention.
         let board = store::load_board(&root).unwrap();
-        assert!(board.cards().get(&"blocked".parse().unwrap()).unwrap().contains(&id));
-        assert!(store::list_intake(&root, id).unwrap().is_empty());
-        assert!(store::session_dir(&root, id).join("hooks/processed/0001.json").exists());
+        assert!(board.cards().get(&"doing".parse().unwrap()).unwrap().contains(&id));
     }
 
     #[test]
-    fn ingest_session_end_moves_to_review() {
-        use crate::controller::{store, apply::apply};
+    fn stop_marks_session_as_needing_human_not_working() {
+        use crate::controller::apply::apply;
         use crate::model::proto::Intent;
+        use crate::model::Phase;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "inbox".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
         let id = TaskId::new(1);
-        record_intake(&root, id, "session-end", "{}").unwrap();
+        // claude finished its turn and handed control back -> it needs the human,
+        // it is NOT working, so no spinner.
+        record_state(&root, id, "stop", "{}").unwrap();
+        assert_eq!(session_phase(&root, id).unwrap(), Phase::Idle);
+        assert!(session_phase(&root, id).unwrap().needs_human_input());
         ingest_session(&root, id).unwrap();
         let board = store::load_board(&root).unwrap();
-        assert!(board.cards().get(&"review".parse().unwrap()).unwrap().contains(&id));
+        // in-progress (needs human) -> stays in doing; the warning icon shows it's waiting.
+        assert!(board.cards().get(&"doing".parse().unwrap()).unwrap().contains(&id));
     }
 
     #[test]
-    fn ingest_untracked_notification_records_no_event() {
-        use crate::controller::{store, apply::apply};
+    fn ingest_session_end_moves_to_done() {
+        use crate::controller::apply::apply;
         use crate::model::proto::Intent;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "inbox".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
         let id = TaskId::new(1);
-        record_intake(&root, id, "notification", "{\"notification_type\":\"auth_success\"}").unwrap();
-        let changed = ingest_session(&root, id).unwrap();
-        assert!(!changed); // untracked notification -> no event, no move
-        assert!(store::load_events(&store::session_dir(&root, id)).unwrap().is_empty());
-        // but the intake file is still drained (moved to processed)
-        assert!(store::list_intake(&root, id).unwrap().is_empty());
+        record_state(&root, id, "session-end", "{}").unwrap();
+        ingest_session(&root, id).unwrap();
+        let board = store::load_board(&root).unwrap();
+        assert!(board.cards().get(&"done".parse().unwrap()).unwrap().contains(&id));
     }
 
     #[test]
-    fn ingest_no_intake_is_noop() {
-        use crate::controller::store;
+    fn ingest_is_idempotent_once_card_is_placed() {
+        use crate::controller::apply::apply;
+        use crate::model::proto::Intent;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
+        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
         let id = TaskId::new(1);
-        std::fs::create_dir_all(store::session_dir(&root, id)).unwrap();
-        assert!(!ingest_session(&root, id).unwrap());
+        record_state(&root, id, "notification", "{\"notification_type\":\"idle_prompt\"}").unwrap();
+        assert!(ingest_session(&root, id).unwrap()); // first move reports change
+        assert!(!ingest_session(&root, id).unwrap()); // already placed -> no change, no broadcast
+    }
+
+    #[test]
+    fn ingest_does_not_resurrect_archived_task() {
+        use crate::controller::apply::apply;
+        use crate::model::proto::Intent;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+        let id = TaskId::new(1);
+        let mut task = store::load_task(&root, id).unwrap();
+        task.status.archived = true;
+        store::save_task(&root, &task).unwrap();
+        // a 'session-start' event would normally move the card to 'doing'…
+        record_state(&root, id, "session-start", "{}").unwrap();
+        ingest_session(&root, id).unwrap();
+        // …but an archived task must not be placed on the board.
+        let board = store::load_board(&root).unwrap();
+        assert!(!board.cards().get(&"doing".parse().unwrap()).unwrap().contains(&id));
+    }
+
+    #[test]
+    fn ingest_no_state_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        crate::controller::apply::apply(&root, crate::model::proto::Intent::CreateTask {
+            title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+        // a created-but-not-yet-handed-off task has no state file -> Pending -> no move
+        assert!(!ingest_session(&root, TaskId::new(1)).unwrap());
+    }
+
+    #[test]
+    fn session_phase_is_pending_without_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        assert_eq!(session_phase(&root, TaskId::new(1)).unwrap(), Phase::Pending);
+    }
+
+    #[test]
+    fn fingerprint_changes_on_phase_change_without_column_move() {
+        use crate::controller::{apply::apply, handoff};
+        use crate::model::proto::Intent;
+        struct NoLaunch;
+        impl handoff::Launcher for NoLaunch {
+            fn launch(&self, _s: &crate::model::WorkerSession, _n: &str) -> anyhow::Result<()> { Ok(()) }
+            fn kill(&self, _n: &str) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+        let id = TaskId::new(1);
+        handoff::handoff(&root, id, "claude", &NoLaunch).unwrap(); // writes session.yaml
+
+        record_state(&root, id, "user-prompt-submit", "{}").unwrap(); // Working
+        ingest_session(&root, id).unwrap(); // -> doing
+        let working_fp = observable_fingerprint(&root).unwrap();
+        // stable when nothing changes
+        assert_eq!(working_fp, observable_fingerprint(&root).unwrap());
+
+        record_state(&root, id, "stop", "{}").unwrap(); // Idle, still in doing (no column move)
+        ingest_session(&root, id).unwrap();
+        let idle_fp = observable_fingerprint(&root).unwrap();
+        assert_ne!(working_fp, idle_fp, "phase change must change the fingerprint even without a card move");
     }
 
     #[test]
     fn reconcile_all_ingests_each_session() {
-        use crate::controller::{store, apply::apply};
+        use crate::controller::apply::apply;
         use crate::model::proto::Intent;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "inbox".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
         let id = TaskId::new(1);
-        record_intake(&root, id, "session-start", "{}").unwrap();
+        record_state(&root, id, "session-start", "{}").unwrap();
         assert!(reconcile_all(&root).unwrap());
         let board = store::load_board(&root).unwrap();
         assert!(board.cards().get(&"doing".parse().unwrap()).unwrap().contains(&id)); // Started -> Working -> doing

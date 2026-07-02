@@ -2,11 +2,29 @@
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
-use crate::model::TaskId;
+use crate::model::{Phase, TaskId};
 use crate::tui::app::{App, Mode};
+
+/// `Working` spinner frames — one entry per render tick. A braille "comet": one
+/// dot at the start, a tail that grows behind the rotating head to four dots,
+/// then unwinds back to one. Baked from a 1-revolution / tail-4 envelope with
+/// eased timing (slow at the ends, fast through the middle, via repeated frames),
+/// so rendering is a plain table index — no per-frame math.
+const SPINNER: [char; 16] = [
+    '⠁', '⠁', '⠁', '⠉', '⠉', '⠙', '⠙', '⠹',
+    '⢹', '⣰', '⣰', '⣄', '⣄', '⠆', '⠆', '⠆',
+];
+
+/// Shown when a worker needs a human: idle, waiting on a permission prompt, or failed.
+const WARNING: char = '\u{f071}'; // nf-fa-warning
+
+fn spinner_frame(tick: u64) -> char {
+    SPINNER[(tick % SPINNER.len() as u64) as usize]
+}
 
 /// Render the full board: one bordered column per board column, a footer key
 /// hint, and (when active) a centered overlay. When the terminal popup is open,
@@ -46,23 +64,27 @@ pub fn render(f: &mut Frame, app: &App, term_screen: Option<&tui_term::vt100::Sc
                 .iter()
                 .enumerate()
                 .map(|(row, task)| {
-                    let mut label = card_title(app, *task);
+                    let mut title = card_title(app, *task);
                     if has_jira(app, *task) {
-                        label = format!("{label} [J]");
+                        title = format!("{title} [J]");
                     }
-                    let mut style = Style::default();
-                    if let Some(sv) = app.session_for(*task) {
-                        label = format!("{label} [{}]", phase_badge(sv.phase));
-                        if sv.needs_human_input {
-                            style = Style::default()
-                                .fg(Color::Red)
-                                .add_modifier(Modifier::BOLD);
+                    // Leading status icon: spinner while working, warning when it
+                    // needs a human, nothing otherwise. A fixed two-cell prefix
+                    // keeps titles aligned across all cards.
+                    let icon = match app.session_for(*task).map(|s| s.phase) {
+                        Some(Phase::Working) => {
+                            Span::raw(format!("{} ", spinner_frame(app.spinner_tick())))
                         }
-                    }
+                        Some(Phase::Idle | Phase::WaitingHuman | Phase::Failed) => {
+                            Span::styled(format!("{WARNING} "), Style::default().fg(Color::Red))
+                        }
+                        _ => Span::raw("  "),
+                    };
+                    let mut style = Style::default();
                     if selected_col && app.selected_row() == row {
                         style = style.add_modifier(Modifier::REVERSED);
                     }
-                    ListItem::new(label).style(style)
+                    ListItem::new(Line::from(vec![icon, Span::raw(title)])).style(style)
                 })
                 .collect();
 
@@ -194,19 +216,6 @@ fn has_jira(app: &App, task: TaskId) -> bool {
         .unwrap_or(false)
 }
 
-/// Short badge text for a worker session's phase, shown next to a card title.
-fn phase_badge(phase: crate::model::Phase) -> &'static str {
-    use crate::model::Phase;
-    match phase {
-        Phase::Working => "working",
-        Phase::WaitingHuman => "blocked",
-        Phase::Idle => "idle",
-        Phase::Completed => "done",
-        Phase::Failed => "failed",
-        Phase::Pending => "pending",
-    }
-}
-
 /// Look up a card's display title from the snapshot, falling back to the id.
 fn card_title(app: &App, task: TaskId) -> String {
     let name = task.to_string();
@@ -240,7 +249,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "Buy milk".into(), summary: "".into(), column: "inbox".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { title: "Buy milk".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
         crate::tui::client::Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap(), sessions: vec![] }
     }
 
@@ -251,7 +260,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "Buy milk".into(), summary: "".into(), column: "inbox".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { title: "Buy milk".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
         let mut task = store::load_task(&root, TaskId::new(1)).unwrap();
         task.spec.summary = "from the shop".into();
         store::save_task(&root, &task).unwrap();
@@ -278,24 +287,54 @@ mod tests {
         terminal.draw(|f| render(f, &app, None)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("Inbox"), "missing column title Inbox");
+        assert!(text.contains("Todo"), "missing column title Todo");
         assert!(text.contains("Doing"), "missing column title Doing");
         assert!(text.contains("Buy milk"), "missing card title");
     }
 
     #[test]
-    fn renders_worker_state_badge() {
+    fn spinner_frame_indexes_table_and_wraps() {
+        assert_eq!(spinner_frame(0), '⠁');
+        assert_eq!(spinner_frame(7), '⠹');
+        assert_eq!(spinner_frame(8), '⢹');
+        assert_eq!(spinner_frame(16), spinner_frame(0)); // wraps
+    }
+
+    fn render_with_phase(phase: crate::model::Phase) -> String {
         use crate::model::proto::SessionView;
-        use crate::model::{Phase, TaskId};
-        let mut s = snap(); // existing ui-test helper with a card "Buy milk" (task-0001) in inbox
-        s.sessions = vec![SessionView { task: TaskId::new(1), session_name: "kanban-task-0001".into(), phase: Phase::WaitingHuman, needs_human_input: true }];
+        use crate::model::TaskId;
+        let mut s = snap(); // card "Buy milk" (task-0001) in inbox
+        s.sessions = vec![SessionView { task: TaskId::new(1), session_name: "kanban-task-0001".into(), phase, needs_human_input: phase.needs_human_input() }];
         let app = App::new(s);
         let backend = TestBackend::new(160, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, &app, None)).unwrap();
-        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn renders_warning_icon_for_needs_human_phases() {
+        for phase in [crate::model::Phase::WaitingHuman, crate::model::Phase::Idle, crate::model::Phase::Failed] {
+            let text = render_with_phase(phase);
+            assert!(text.contains("Buy milk"), "{phase:?}: title missing");
+            assert!(text.contains(WARNING), "{phase:?}: warning icon missing");
+        }
+    }
+
+    #[test]
+    fn renders_spinner_for_working() {
+        let text = render_with_phase(crate::model::Phase::Working);
         assert!(text.contains("Buy milk"));
-        assert!(text.contains("blocked")); // badge text for WaitingHuman
+        assert!(text.contains(spinner_frame(0)), "working should show a spinner frame");
+        assert!(!text.contains(WARNING), "working must not show the warning icon");
+    }
+
+    #[test]
+    fn renders_no_status_icon_when_done() {
+        let text = render_with_phase(crate::model::Phase::Completed);
+        assert!(text.contains("Buy milk"));
+        assert!(!text.contains(WARNING), "done must not warn");
+        assert!(!text.contains(spinner_frame(8)), "done must not spin"); // ⢹ is spinner-only
     }
 
     #[test]

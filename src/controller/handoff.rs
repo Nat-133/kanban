@@ -58,15 +58,19 @@ pub fn prepare_session(
         anyhow::anyhow!("task metadata.name is not a valid task id: {}", task.metadata.name)
     })?;
     let sdir = root.join("sessions").join(id.to_string());
-    std::fs::create_dir_all(sdir.join("hooks/intake"))?;
-    std::fs::create_dir_all(sdir.join("hooks/processed"))?;
-    // Canonicalize to an absolute path: the worker runs with `sdir` (or the repo)
-    // as its cwd, so the `--settings` and `--add-dir` paths derived from it must be
-    // absolute or they won't resolve. A relative `--root` would otherwise launch a
-    // worker that dies instantly on a missing settings file.
+    // The session dir is the control plane (state.yaml, session.yaml, hooks/) and is
+    // NOT writable by the agent. The agent gets a nested work/ sandbox: its cwd and
+    // the only path on its allowlist, holding the handoff and context it may touch.
+    std::fs::create_dir_all(sdir.join("hooks"))?;
+    std::fs::create_dir_all(sdir.join("work"))?;
+    // Canonicalize to an absolute path: the worker runs with the work dir (or the
+    // repo) as its cwd, so the `--settings` and `--add-dir` paths derived from it
+    // must be absolute or they won't resolve. A relative `--root` would otherwise
+    // launch a worker that dies instantly on a missing settings file.
     let sdir = std::fs::canonicalize(&sdir)?;
+    let work = sdir.join("work");
 
-    // symlink each allowlisted context file (relative to the task dir) into the session dir
+    // symlink each allowlisted context file (relative to the task dir) into work/
     for entry in &task.spec.context.include {
         let src = store::task_dir(root, id).join(entry);
         let src_abs = match std::fs::canonicalize(&src) {
@@ -80,13 +84,13 @@ pub fn prepare_session(
             Some(n) => n.to_owned(),
             None => continue,
         };
-        let link = sdir.join(&name);
+        let link = work.join(&name);
         let _ = std::fs::remove_file(&link); // idempotent: clear any stale link
         std::os::unix::fs::symlink(&src_abs, &link)?;
     }
 
-    // handoff.md
-    std::fs::write(sdir.join("handoff.md"), render_handoff(task))?;
+    // handoff.md (a read material for the agent, so it lives in work/)
+    std::fs::write(work.join("handoff.md"), render_handoff(task))?;
 
     // command: worker.command + substituted args + one --add-dir per expanded base dir
     let task_id = id.to_string();
@@ -95,11 +99,12 @@ pub fn prepare_session(
     for arg in &worker.args {
         command.push(substitute(arg, &task_id, repo));
     }
-    // Always allowlist the session workspace by absolute path. When a task has a
-    // repo the worker's cwd is the repo, so a relative `--add-dir` would resolve
-    // there and the worker couldn't read its own handoff.md / write notes.md.
+    // Always allowlist the work/ sandbox by absolute path — and only that, never the
+    // control-plane session dir. When a task has a repo the worker's cwd is the repo,
+    // so a relative `--add-dir` would resolve there and the worker couldn't read its
+    // own handoff.md / write notes.md.
     command.push("--add-dir".to_string());
-    command.push(sdir.display().to_string());
+    command.push(work.display().to_string());
     for entry in base_dirs {
         for path in expand_base_dir(entry) {
             command.push("--add-dir".to_string());
@@ -144,14 +149,14 @@ pub fn prepare_session(
     let prompt = format!(
         "Read the task handoff at {} and start working on the task it describes, \
          following the instructions in that file.",
-        sdir.join("handoff.md").display()
+        work.join("handoff.md").display()
     );
     command.insert(3, prompt);
 
-    // workdir: the task's repo (tilde-expanded) if set, else the session workspace
+    // workdir: the task's repo (tilde-expanded) if set, else the agent's work/ sandbox
     let workdir = match repo {
         Some(r) => PathBuf::from(expand_tilde(r)),
-        None => sdir.clone(),
+        None => work.clone(),
     };
 
     Ok(WorkerSession {
@@ -295,11 +300,12 @@ mod tests {
         let session = prepare_session(&root, &task, "claude", worker, &cfg.agents.base_dirs).unwrap();
 
         let sdir = root.join("sessions").join(id.to_string());
-        assert!(sdir.join("hooks/intake").is_dir());
-        assert!(sdir.join("hooks/processed").is_dir());
-        assert!(sdir.join("handoff.md").exists());
-        let link = sdir.join("notes.md");
-        assert!(std::fs::symlink_metadata(&link).is_ok(), "notes.md should be symlinked");
+        // control-plane files stay at the top; the agent works inside work/
+        let work = sdir.join("work");
+        assert!(work.is_dir(), "agent work/ sandbox should exist");
+        assert!(work.join("handoff.md").exists());
+        let link = work.join("notes.md");
+        assert!(std::fs::symlink_metadata(&link).is_ok(), "notes.md should be symlinked into work/");
         assert_eq!(std::fs::read_to_string(&link).unwrap(), "hi");
         assert_eq!(session.spec.command.first().unwrap(), "claude");
         assert!(session.spec.command.iter().any(|a| a.contains(&format!("sessions/{id}"))));
@@ -311,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_session_allowlists_session_dir_by_absolute_path() {
+    fn prepare_session_allowlists_work_dir_not_control_plane() {
         use crate::controller::store;
         use crate::model::TaskId;
         let dir = tempfile::tempdir().unwrap();
@@ -319,18 +325,21 @@ mod tests {
         store::init_workspace(&root).unwrap();
         let id = TaskId::new(1);
         let mut task = sample_task(id, "Do the thing");
-        // A repo means cwd is the repo, not the session dir, so the session dir
-        // holding handoff.md must be allowlisted by absolute path.
+        // A repo means cwd is the repo, so the agent's work/ sandbox (holding
+        // handoff.md) must be allowlisted by absolute path.
         task.spec.repo = Some("~/vcs/whatever".into());
         store::save_task(&root, &task).unwrap();
         let cfg = store::load_config(&root).unwrap();
         let session = prepare_session(&root, &task, "claude", cfg.workers.get("claude").unwrap(), &cfg.agents.base_dirs).unwrap();
 
+        let work = session.spec.workspace.join("work").display().to_string();
         let sdir = session.spec.workspace.display().to_string();
         let cmd = &session.spec.command;
-        let idx = cmd.iter().position(|a| a == &sdir)
-            .unwrap_or_else(|| panic!("session dir {sdir} not allowlisted; cmd={cmd:?}"));
-        assert_eq!(cmd[idx - 1], "--add-dir", "session dir must follow --add-dir; cmd={cmd:?}");
+        let idx = cmd.iter().position(|a| a == &work)
+            .unwrap_or_else(|| panic!("work dir {work} not allowlisted; cmd={cmd:?}"));
+        assert_eq!(cmd[idx - 1], "--add-dir", "work dir must follow --add-dir; cmd={cmd:?}");
+        // the control-plane session dir must NOT be allowlisted on its own
+        assert!(!cmd.iter().any(|a| a == &sdir), "control-plane dir must not be allowlisted; cmd={cmd:?}");
     }
 
     #[test]
@@ -349,7 +358,7 @@ mod tests {
         // Without an initial prompt the worker launches into an idle interactive
         // session: some command arg must point it at its handoff brief.
         let cmd = &session.spec.command;
-        let handoff = session.spec.workspace.join("handoff.md").display().to_string();
+        let handoff = session.spec.workspace.join("work").join("handoff.md").display().to_string();
         let idx = cmd.iter().position(|a| a.contains(&handoff))
             .unwrap_or_else(|| panic!("no initial prompt referencing {handoff}; cmd={cmd:?}"));
         // It must not be the final token: a trailing positional would be eaten by
@@ -403,7 +412,7 @@ mod tests {
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
         crate::controller::apply::apply(&root, crate::model::proto::Intent::CreateTask {
-            title: "A".into(), summary: "".into(), column: "inbox".parse().unwrap() }).unwrap();
+            title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
 
         let fake = FakeLauncher::default();
         handoff(&root, TaskId::new(1), "claude", &fake).unwrap();
@@ -424,7 +433,7 @@ mod tests {
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
         crate::controller::apply::apply(&root, crate::model::proto::Intent::CreateTask {
-            title: "A".into(), summary: "".into(), column: "inbox".parse().unwrap() }).unwrap();
+            title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
         let fake = FakeLauncher::default();
         assert!(handoff(&root, TaskId::new(1), "nope", &fake).is_err());
     }

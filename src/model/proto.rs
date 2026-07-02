@@ -29,6 +29,15 @@ pub enum Response {
     Error { message: String },
 }
 
+/// Body of a `/v1/wake` request: the hook telling the controller that a session's
+/// state file changed and its card should be reconciled. Carries only the id —
+/// the new state lives in the session's `state.yaml`, which the controller re-reads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WakeRequest {
+    pub task: TaskId,
+}
+
 /// A worker session as surfaced in a board snapshot: identity plus derived phase.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,7 +54,7 @@ mod tests {
 
     #[test]
     fn create_task_intent_round_trips_json() {
-        let intent = Intent::CreateTask { title: "Build X".into(), summary: "do X".into(), column: "inbox".parse().unwrap() };
+        let intent = Intent::CreateTask { title: "Build X".into(), summary: "do X".into(), column: "todo".parse().unwrap() };
         let j = serde_json::to_string(&intent).unwrap();
         let back: Intent = serde_json::from_str(&j).unwrap();
         assert_eq!(intent, back);
@@ -71,6 +80,15 @@ mod tests {
         let sv = SessionView { task: TaskId::new(1), session_name: "kanban-task-0001".into(), phase: crate::model::Phase::WaitingHuman, needs_human_input: true };
         let back: SessionView = serde_json::from_str(&serde_json::to_string(&sv).unwrap()).unwrap();
         assert_eq!(sv, back);
+    }
+
+    #[test]
+    fn wake_request_round_trips() {
+        let w = WakeRequest { task: TaskId::new(7) };
+        let j = serde_json::to_string(&w).unwrap();
+        let back: WakeRequest = serde_json::from_str(&j).unwrap();
+        assert_eq!(w, back);
+        assert!(j.contains("task-0007"));
     }
 
     #[test]

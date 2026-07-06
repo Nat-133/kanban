@@ -1,6 +1,7 @@
 use crate::controller::store;
 use crate::model::TaskId;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
@@ -96,6 +97,27 @@ pub fn load(root: &Path) -> anyhow::Result<Vec<ActivityEvent>> {
     Ok(out)
 }
 
+/// Aggregate counts folded from the activity log. The headline KPI is
+/// interruptions-per-task — invariant to how many tasks exist or how long the
+/// human was away, unlike a wall-clock rate. `Steer` and `ProfileChanged` are
+/// not interruptions and are excluded. `BTreeMap` gives deterministic ordering
+/// for printing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Summary {
+    pub interruptions_per_task: BTreeMap<TaskId, usize>,
+}
+
+/// Fold the log into a `Summary`, counting only `Interruption` events per task.
+pub fn summary(events: &[ActivityEvent]) -> Summary {
+    let mut interruptions_per_task = BTreeMap::new();
+    for e in events {
+        if matches!(e.kind, ActivityKind::Interruption { .. }) {
+            *interruptions_per_task.entry(e.task).or_insert(0) += 1;
+        }
+    }
+    Summary { interruptions_per_task }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +197,21 @@ mod tests {
         let back: ActivityEvent = serde_json::from_str(&j).unwrap();
         assert_eq!(e, back);
         assert!(j.contains("\"permissionPrompt\""));
+    }
+
+    #[test]
+    fn summary_counts_interruptions_per_task() {
+        let mk = |task: u32, kind: ActivityKind| ActivityEvent {
+            observed_at: time::OffsetDateTime::UNIX_EPOCH, task: TaskId::new(task),
+            profile: "default".into(), kind };
+        let evs = vec![
+            mk(1, ActivityKind::Interruption { reason: InterruptionReason::PermissionPrompt }),
+            mk(1, ActivityKind::Interruption { reason: InterruptionReason::Idle }),
+            mk(1, ActivityKind::Steer),
+            mk(2, ActivityKind::Interruption { reason: InterruptionReason::PermissionPrompt }),
+        ];
+        let s = summary(&evs);
+        assert_eq!(s.interruptions_per_task[&TaskId::new(1)], 2); // steer is NOT an interruption
+        assert_eq!(s.interruptions_per_task[&TaskId::new(2)], 1);
     }
 }

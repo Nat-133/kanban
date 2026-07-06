@@ -26,6 +26,8 @@ enum Command {
         #[arg(long, default_value = "http://127.0.0.1:7777")]
         daemon: String,
     },
+    /// Show the human-involvement activity log and summary counts.
+    Activity,
     /// Internal: called by Claude Code hooks to record a worker event.
     Hook {
         /// The event name (e.g. notification, stop, session-start).
@@ -54,6 +56,29 @@ fn main() -> anyhow::Result<()> {
         Command::Tui { daemon } => {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
             rt.block_on(kanban::tui::run::run(daemon))
+        }
+        Command::Activity => {
+            use kanban::controller::activity::ActivityKind;
+            let evs = kanban::controller::activity::load(&cli.root)?;
+            for e in &evs {
+                let kind = match &e.kind {
+                    ActivityKind::Interruption { reason } => format!("interruption ({reason:?})"),
+                    ActivityKind::Steer => "steer".to_string(),
+                    ActivityKind::ProfileChanged { from, to } => {
+                        format!("profile-changed {} -> {to}", from.as_deref().unwrap_or("(none)"))
+                    }
+                };
+                println!("{}  {}  {}  {kind}", e.observed_at, e.task, e.profile);
+            }
+            let summary = kanban::controller::activity::summary(&evs);
+            println!("\ninterruptions per task:");
+            if summary.interruptions_per_task.is_empty() {
+                println!("  (none)");
+            }
+            for (task, count) in &summary.interruptions_per_task {
+                println!("  {task}: {count}");
+            }
+            Ok(())
         }
         Command::Hook { event, session } => {
             use std::io::Read;

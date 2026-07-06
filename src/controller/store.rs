@@ -35,6 +35,10 @@ pub fn load_config(root: &Path) -> anyhow::Result<Config> {
     Ok(serde_yml::from_str(&text)?)
 }
 
+// The `contexts.default` block below must correspond to
+// `PermissionContext::builtin_default()` (model/mod.rs); they are the same profile
+// expressed as human-editable YAML vs. code. `init_writes_default_permission_context`
+// asserts they stay in sync.
 fn default_config_yaml() -> &'static str {
     r#"agents:
   baseDirs:
@@ -460,8 +464,9 @@ mod tests {
         init_workspace(&root).unwrap();
         let cfg = load_config(&root).unwrap();
         let c = cfg.contexts.get("default").expect("default context present");
-        assert!(c.allow.iter().any(|p| p.starts_with("Bash")));
-        assert!(c.ask.iter().any(|p| p.contains("git push")));
+        // The shipped YAML and builtin_default() are hand-maintained in parallel;
+        // lock them together so drift on either side fails here.
+        assert_eq!(c, &PermissionContext::builtin_default());
     }
 
     fn sample_task(id: TaskId, title: &str) -> Task {

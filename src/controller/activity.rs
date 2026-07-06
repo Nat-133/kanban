@@ -44,6 +44,11 @@ pub fn activity_dir(root: &Path) -> PathBuf {
 
 /// Append one immutable fact. Filename = nanos-pid so it is time-ordered and
 /// unique across the hook and daemon processes; never overwrites an existing file.
+///
+/// The `{nanos}-{pid}` name assumes distinct nanoseconds per process: two appends
+/// in the same process at the same nanosecond would collide and the second would
+/// silently overwrite the first. This is realistically unreachable at nanosecond
+/// resolution, and the hook path emits one event per process anyway.
 pub fn append(root: &Path, event: &ActivityEvent) -> anyhow::Result<()> {
     let nanos = event.observed_at.unix_timestamp_nanos();
     let pid = std::process::id();
@@ -53,6 +58,13 @@ pub fn append(root: &Path, event: &ActivityEvent) -> anyhow::Result<()> {
 }
 
 /// Load every fact, ascending by filename (i.e. by time). Missing dir => empty.
+///
+/// A single unreadable or unparseable file is skipped (warned) rather than fatal —
+/// the activity log is a best-effort observability record, so one corrupt byte must
+/// not take down the whole query. An unreadable directory is still fatal.
+///
+/// The lexical-sort == time-order invariant assumes post-epoch (non-negative)
+/// timestamps, so the zero-padded nanos filenames sort in chronological order.
 pub fn load(root: &Path) -> anyhow::Result<Vec<ActivityEvent>> {
     let dir = activity_dir(root);
     if !dir.exists() {
@@ -65,8 +77,21 @@ pub fn load(root: &Path) -> anyhow::Result<Vec<ActivityEvent>> {
     names.sort();
     let mut out = Vec::new();
     for n in names {
-        let text = std::fs::read_to_string(dir.join(&n))?;
-        out.push(serde_json::from_str(&text)?);
+        let path = dir.join(&n);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                tracing::warn!(file = %n.to_string_lossy(), error = %e, "skipping unreadable activity file");
+                continue;
+            }
+        };
+        match serde_json::from_str(&text) {
+            Ok(event) => out.push(event),
+            Err(e) => {
+                tracing::warn!(file = %n.to_string_lossy(), error = %e, "skipping unparseable activity file");
+                continue;
+            }
+        }
     }
     Ok(out)
 }
@@ -92,6 +117,25 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].observed_at.unix_timestamp(), 100, "sorted ascending by time");
         assert_eq!(all[1].task, TaskId::new(2));
+    }
+
+    #[test]
+    fn load_skips_unreadable_files_and_returns_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        std::fs::create_dir_all(&root).unwrap();
+        // one valid event...
+        append(&root, &ActivityEvent {
+            observed_at: time::OffsetDateTime::from_unix_timestamp(100).unwrap(),
+            task: TaskId::new(1),
+            profile: "default".into(),
+            kind: ActivityKind::Steer,
+        }).unwrap();
+        // ...and one corrupt file in the activity dir
+        std::fs::write(activity_dir(&root).join("00000000000000000001-99.json"), "{ not json").unwrap();
+        let all = load(&root).unwrap();
+        assert_eq!(all.len(), 1, "corrupt file skipped, valid event still returned");
+        assert_eq!(all[0].task, TaskId::new(1));
     }
 
     #[test]

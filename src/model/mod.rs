@@ -224,6 +224,10 @@ pub struct TaskSpec {
     pub jira: Jira,
     #[serde(default)]
     pub context: Context,
+    /// Permission profile name (key into `Config.contexts`). None ⇒ "default".
+    /// NOTE: distinct from `context` above, which is the file allowlist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -421,6 +425,43 @@ pub struct Config {
     pub contexts: std::collections::BTreeMap<String, PermissionContext>,
 }
 
+impl Config {
+    /// Resolve a task's profile to its context. Precedence: named context in
+    /// config → the config's "default" context → a built-in broad fallback.
+    /// Owned (not borrowed) so the built-in fallback has somewhere to live.
+    pub fn context_for(&self, profile: Option<&str>) -> PermissionContext {
+        let name = profile.unwrap_or("default");
+        if let Some(c) = self.contexts.get(name) {
+            return c.clone();
+        }
+        if let Some(c) = self.contexts.get("default") {
+            return c.clone();
+        }
+        PermissionContext::builtin_default()
+    }
+}
+
+impl PermissionContext {
+    /// Broad fallback used when config defines no contexts: allow the common
+    /// local tools, ask on deliberately-visible outbound actions, deny nothing.
+    pub fn builtin_default() -> Self {
+        let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+        PermissionContext {
+            allow: s(&["Bash", "Edit", "Write", "Read", "Glob", "Grep", "WebFetch", "WebSearch"]),
+            ask: s(&[
+                "Bash(git push:*)",
+                "Bash(git push --force:*)",
+                "Bash(gh pr create:*)",
+                "Bash(gh pr merge:*)",
+                "Bash(gh pr review:*)",
+            ]),
+            deny: vec![],
+            mcp: vec![],
+            egress: vec![],
+        }
+    }
+}
+
 /// A named permission profile. `allow`/`ask`/`deny` are Claude Code tool-rule
 /// patterns baked into a session's settings.json at handoff. `mcp` lists MCP
 /// servers the context opts into loading. `egress` is RESERVED: it documents the
@@ -497,6 +538,34 @@ spec:
         assert_eq!(t.spec.repo.as_deref(), Some("~/vcs/my-project"));
         assert_eq!(t.spec.context.include.len(), 2);
         assert_eq!(t.status.worker_session_ref, None);
+    }
+
+    #[test]
+    fn task_profile_defaults_to_none_and_parses() {
+        let yaml = "\
+apiVersion: kanban.local/v1alpha1
+kind: Task
+metadata: { name: task-0001 }
+spec:
+  title: T
+  summary: S
+  descriptionRef: description.md
+  notesRef: notes.md
+  profile: cluster-ops
+";
+        let t: Task = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(t.spec.profile.as_deref(), Some("cluster-ops"));
+    }
+
+    #[test]
+    fn context_for_falls_back_to_builtin_default() {
+        // Empty config: unknown/None profile resolves to the built-in broad default,
+        // never panics, never returns an empty allowlist.
+        let cfg = Config::default();
+        let c = cfg.context_for(None);
+        assert!(c.allow.iter().any(|p| p.starts_with("Bash")), "builtin default must be broad");
+        let c2 = cfg.context_for(Some("does-not-exist"));
+        assert_eq!(c, c2, "unknown profile falls back to default");
     }
 
     #[test]

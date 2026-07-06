@@ -439,6 +439,7 @@ mod tests {
                 title: title.into(), summary: String::new(), color: None,
                 description_ref: "description.md".into(), notes_ref: "notes.md".into(),
                 acceptance_criteria: vec![], repo: None, jira: Default::default(), context: Default::default(),
+                profile: None,
             },
             status: Default::default(),
         }

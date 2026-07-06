@@ -88,6 +88,12 @@ pub fn record_state(root: &Path, id: TaskId, event: &str, raw_payload: &str) -> 
             tracing::warn!(error = %e, "failed to append activity event");
         }
     }
+    // Best-effort session metadata capture (session_id on start; transcript copy
+    // on end). Must never break state recording, so any failure is warned and
+    // swallowed and never touches record_state's return value.
+    if let Err(e) = capture_session_metadata(root, id, &item.event, &item.payload) {
+        tracing::warn!(error = %e, "failed to capture session metadata");
+    }
     match to_event(&item) {
         Some(ev) => {
             store::save_state(root, id, &ev)?;
@@ -95,6 +101,42 @@ pub fn record_state(root: &Path, id: TaskId, event: &str, raw_payload: &str) -> 
         }
         None => Ok(false),
     }
+}
+
+/// Capture Claude Code hook metadata into the session record: the `session_id`
+/// (seeds a future resume) and, on `session-end`, a copy of the transcript into
+/// the session dir (Claude GCs the original after ~30 days, so we preserve it
+/// where Task 10's archive keeps it). Best-effort: a missing session or an
+/// unreadable transcript is not an error — the hook must still record state.
+fn capture_session_metadata(
+    root: &Path,
+    id: TaskId,
+    event: &str,
+    payload: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let Some(mut session) = store::load_session(root, id)? else { return Ok(()); };
+    let mut changed = false;
+    if let Some(sid) = payload.get("session_id").and_then(|v| v.as_str()) {
+        if session.status.session_id.as_deref() != Some(sid) {
+            session.status.session_id = Some(sid.to_string());
+            changed = true;
+        }
+    }
+    if event == "session-end" {
+        if let Some(tp) = payload.get("transcript_path").and_then(|v| v.as_str()) {
+            let dst = store::session_dir(root, id).join("transcript.jsonl");
+            if std::fs::copy(tp, &dst).is_ok() {
+                session.status.transcript_ref = Some("transcript.jsonl".into());
+                changed = true;
+            } else {
+                tracing::warn!(transcript_path = %tp, "could not copy worker transcript");
+            }
+        }
+    }
+    if changed {
+        store::save_session(root, &session)?;
+    }
+    Ok(())
 }
 
 /// The phase a session is currently in, derived from its state file. A session
@@ -397,6 +439,59 @@ mod tests {
         ingest_session(&root, id).unwrap();
         let idle_fp = observable_fingerprint(&root).unwrap();
         assert_ne!(working_fp, idle_fp, "phase change must change the fingerprint even without a card move");
+    }
+
+    #[test]
+    fn session_end_copies_transcript_into_session_dir() {
+        use crate::controller::{apply::apply, handoff};
+        use crate::model::proto::Intent;
+        struct NoLaunch;
+        impl handoff::Launcher for NoLaunch {
+            fn launch(&self, _s: &crate::model::WorkerSession, _n: &str) -> anyhow::Result<()> { Ok(()) }
+            fn kill(&self, _n: &str) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(),
+            column: "todo".parse().unwrap() }).unwrap();
+        let id = TaskId::new(1);
+        handoff::handoff(&root, id, "claude", &NoLaunch).unwrap(); // writes session.yaml
+
+        let tpath = dir.path().join("orig-transcript.jsonl");
+        std::fs::write(&tpath, "{\"m\":1}\n{\"m\":2}\n").unwrap();
+        let payload = format!("{{\"session_id\":\"abc-123\",\"transcript_path\":\"{}\"}}",
+            tpath.display());
+
+        record_state(&root, id, "session-end", &payload).unwrap();
+
+        let copied = store::session_dir(&root, id).join("transcript.jsonl");
+        assert_eq!(std::fs::read_to_string(&copied).unwrap(), "{\"m\":1}\n{\"m\":2}\n");
+        let s = store::load_session(&root, id).unwrap().unwrap();
+        assert_eq!(s.status.transcript_ref.as_deref(), Some("transcript.jsonl"));
+    }
+
+    #[test]
+    fn session_start_records_session_id() {
+        use crate::controller::{apply::apply, handoff};
+        use crate::model::proto::Intent;
+        struct NoLaunch;
+        impl handoff::Launcher for NoLaunch {
+            fn launch(&self, _s: &crate::model::WorkerSession, _n: &str) -> anyhow::Result<()> { Ok(()) }
+            fn kill(&self, _n: &str) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(),
+            column: "todo".parse().unwrap() }).unwrap();
+        let id = TaskId::new(1);
+        handoff::handoff(&root, id, "claude", &NoLaunch).unwrap();
+
+        record_state(&root, id, "session-start", "{\"session_id\":\"abc-123\"}").unwrap();
+
+        let s = store::load_session(&root, id).unwrap().unwrap();
+        assert_eq!(s.status.session_id.as_deref(), Some("abc-123"));
     }
 
     #[test]

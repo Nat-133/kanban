@@ -395,6 +395,8 @@ pub struct WorkerSessionStatus {
     pub last_event_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// Unlike other resources, the envelope fields (`apiVersion`/`kind`/`metadata`)

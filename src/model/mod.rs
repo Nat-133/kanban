@@ -417,6 +417,29 @@ pub struct Config {
     pub agents: AgentConfig,
     #[serde(default)]
     pub workers: BTreeMap<String, WorkerConfig>,
+    #[serde(default)]
+    pub contexts: std::collections::BTreeMap<String, PermissionContext>,
+}
+
+/// A named permission profile. `allow`/`ask`/`deny` are Claude Code tool-rule
+/// patterns baked into a session's settings.json at handoff. `mcp` lists MCP
+/// servers the context opts into loading. `egress` is RESERVED: it documents the
+/// intended network-destination allowlist but is NOT enforced yet (real exfil
+/// containment needs the worker sandbox — a later thread).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionContext {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub ask: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+    #[serde(default)]
+    pub mcp: Vec<String>,
+    /// Reserved; not enforced. See type doc.
+    #[serde(default)]
+    pub egress: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -672,5 +695,22 @@ workers:
         let e2: WorkerEvent = serde_yml::from_str(&s).unwrap();
         assert_eq!(e, e2);
         assert_eq!(e.kind, WorkerEventKind::HumanInputRequired(Notification::PermissionPrompt));
+    }
+
+    #[test]
+    fn config_parses_contexts() {
+        let yaml = "\
+contexts:
+  default:
+    allow: [\"Bash\", \"Edit\"]
+    ask: [\"Bash(git push:*)\"]
+";
+        let cfg: Config = serde_yml::from_str(yaml).unwrap();
+        let c = cfg.contexts.get("default").unwrap();
+        assert_eq!(c.allow, vec!["Bash".to_string(), "Edit".to_string()]);
+        assert_eq!(c.ask, vec!["Bash(git push:*)".to_string()]);
+        assert!(c.deny.is_empty());
+        assert!(c.mcp.is_empty());
+        assert!(c.egress.is_empty());
     }
 }

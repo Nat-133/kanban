@@ -104,10 +104,12 @@ pub fn record_state(root: &Path, id: TaskId, event: &str, raw_payload: &str) -> 
 }
 
 /// Capture Claude Code hook metadata into the session record: the `session_id`
-/// (seeds a future resume) and, on `session-end`, a copy of the transcript into
-/// the session dir (Claude GCs the original after ~30 days, so we preserve it
-/// where Task 10's archive keeps it). Best-effort: a missing session or an
-/// unreadable transcript is not an error — the hook must still record state.
+/// (seeds a future resume) and, on a terminal event (`session-end` or
+/// `stop-failure`), a copy of the transcript into the session dir (Claude GCs the
+/// original after ~30 days, so we preserve it where Task 10's archive keeps it —
+/// a failed session's transcript is the most worth keeping). Best-effort: a
+/// missing session or an unreadable transcript is not an error — the hook must
+/// still record state.
 fn capture_session_metadata(
     root: &Path,
     id: TaskId,
@@ -122,14 +124,15 @@ fn capture_session_metadata(
             changed = true;
         }
     }
-    if event == "session-end" {
+    if event == "session-end" || event == "stop-failure" {
         if let Some(tp) = payload.get("transcript_path").and_then(|v| v.as_str()) {
             let dst = store::session_dir(root, id).join("transcript.jsonl");
-            if std::fs::copy(tp, &dst).is_ok() {
-                session.status.transcript_ref = Some("transcript.jsonl".into());
-                changed = true;
-            } else {
-                tracing::warn!(transcript_path = %tp, "could not copy worker transcript");
+            match std::fs::copy(tp, &dst) {
+                Ok(_) => {
+                    session.status.transcript_ref = Some("transcript.jsonl".into());
+                    changed = true;
+                }
+                Err(e) => tracing::warn!(transcript_path = %tp, error = %e, "could not copy worker transcript"),
             }
         }
     }

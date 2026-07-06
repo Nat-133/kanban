@@ -23,6 +23,16 @@ pub fn apply(root: &Path, intent: Intent) -> anyhow::Result<Response> {
                 .into_iter()
                 .filter(|t| !t.status.archived)
                 .collect();
+            // Load each live task's long-form description alongside it, so the
+            // TUI can render full detail without a filesystem round-trip.
+            let mut descriptions = std::collections::BTreeMap::new();
+            for t in &tasks {
+                if let Ok(id) = t.metadata.name.parse::<TaskId>() {
+                    if let Some(text) = store::load_description(root, id, &t.spec.description_ref)? {
+                        descriptions.insert(id, text);
+                    }
+                }
+            }
             let mut sessions = Vec::new();
             for s in store::load_all_sessions(root)? {
                 let phase = crate::controller::events::session_phase(root, s.spec.task_ref)?;
@@ -33,7 +43,7 @@ pub fn apply(root: &Path, intent: Intent) -> anyhow::Result<Response> {
                     needs_human_input: phase.needs_human_input(),
                 });
             }
-            Ok(Response::Snapshot { board, tasks, sessions })
+            Ok(Response::Snapshot { board, tasks, sessions, descriptions })
         }
         Intent::CreateTask { title, summary, column } => create_task(root, title, summary, column),
         Intent::EditTask { task, title, summary } => edit_task(root, task, title, summary),
@@ -80,6 +90,13 @@ fn create_task(root: &Path, title: String, summary: String, column: ColumnId) ->
         status: Default::default(),
     };
     store::save_task(root, &task)?;
+    // Seed the description file so it exists for the worker handoff (which
+    // points at `description.md`) and for anyone editing it externally. Prose
+    // lives in this Markdown file, never inline in task.yaml.
+    store::atomic_write(
+        &store::task_dir(root, id).join(&task.spec.description_ref),
+        &format!("# {}\n", task.spec.title),
+    )?;
     raw.spec.cards.entry(column).or_default().push(id);
     let board = match Board::try_from(raw) {
         Ok(b) => b,
@@ -208,6 +225,22 @@ mod tests {
         let d = setup(); let r = root(&d);
         let resp = apply(&r, Intent::CreateTask { title: "x".into(), summary: "s".into(), column: col("ghost") }).unwrap();
         assert!(matches!(resp, Response::Error { .. }));
+    }
+
+    #[test]
+    fn create_task_seeds_description_file_and_get_board_returns_it() {
+        let d = setup(); let r = root(&d);
+        apply(&r, Intent::CreateTask { title: "Write docs".into(), summary: "s".into(), column: col("todo") }).unwrap();
+        // the description file is seeded on disk with the title heading
+        let desc = crate::controller::store::load_description(&r, TaskId::new(1), "description.md").unwrap();
+        assert_eq!(desc.as_deref(), Some("# Write docs\n"));
+        // and the snapshot carries it keyed by task id
+        match apply(&r, Intent::GetBoard).unwrap() {
+            Response::Snapshot { descriptions, .. } => {
+                assert_eq!(descriptions.get(&TaskId::new(1)).map(String::as_str), Some("# Write docs\n"));
+            }
+            o => panic!("expected snapshot, got {o:?}"),
+        }
     }
 
     #[test]

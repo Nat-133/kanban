@@ -2,6 +2,7 @@
 
 use crate::model::{Board, ColumnId, Phase, Task, TaskId};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Requests a client sends to the controller. Internally tagged on `type`
 /// (camelCase) so the JSON reads `{"type":"createTask", ...}`.
@@ -22,8 +23,17 @@ pub enum Intent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Response {
-    /// Full board snapshot: the board plus every live (non-archived) task.
-    Snapshot { board: Board, tasks: Vec<Task>, sessions: Vec<SessionView> },
+    /// Full board snapshot: the board, every live (non-archived) task, its
+    /// worker sessions, and each task's long-form description keyed by id.
+    /// Descriptions are prose from the per-task `description.md`; a task with
+    /// no description file simply has no entry.
+    Snapshot {
+        board: Board,
+        tasks: Vec<Task>,
+        sessions: Vec<SessionView>,
+        #[serde(default)]
+        descriptions: BTreeMap<TaskId, String>,
+    },
     /// A mutation succeeded; carries the affected task id when relevant.
     Ok { task: Option<TaskId> },
     Error { message: String },

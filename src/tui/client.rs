@@ -1,7 +1,8 @@
 // http client — Task 2
 
 use crate::model::proto::{Intent, Response};
-use crate::model::{Board, Task};
+use crate::model::{Board, Task, TaskId};
+use std::collections::BTreeMap;
 
 /// The board view the TUI renders (pulled from a `Response::Snapshot`).
 #[derive(Debug, Clone)]
@@ -9,6 +10,9 @@ pub struct Snapshot {
     pub board: Board,
     pub tasks: Vec<Task>,
     pub sessions: Vec<crate::model::proto::SessionView>,
+    /// Each task's long-form description, keyed by id. A task with no
+    /// `description.md` has no entry here.
+    pub descriptions: BTreeMap<TaskId, String>,
 }
 
 pub struct Client {
@@ -32,7 +36,7 @@ impl Client {
 
     pub async fn snapshot(&self) -> anyhow::Result<Snapshot> {
         match self.send(Intent::GetBoard).await? {
-            Response::Snapshot { board, tasks, sessions } => Ok(Snapshot { board, tasks, sessions }),
+            Response::Snapshot { board, tasks, sessions, descriptions } => Ok(Snapshot { board, tasks, sessions, descriptions }),
             Response::Error { message } => Err(anyhow::anyhow!(message)),
             Response::Ok { .. } => Err(anyhow::anyhow!("unexpected Ok response to GetBoard")),
         }

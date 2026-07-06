@@ -3,7 +3,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::model::{Phase, TaskId};
@@ -169,6 +169,15 @@ pub fn render(f: &mut Frame, app: &App, term_screen: Option<&tui_term::vt100::Sc
                     lines.push(spec.summary.clone());
                     lines.push(String::new());
                 }
+                // Long-form description from the task's description.md. Rendered
+                // verbatim (Markdown source), one board line per source line.
+                if let Some(desc) = app.detail_description().map(str::trim).filter(|d| !d.is_empty()) {
+                    lines.push("Description:".to_string());
+                    for line in desc.lines() {
+                        lines.push(format!("  {line}"));
+                    }
+                    lines.push(String::new());
+                }
                 if !spec.acceptance_criteria.is_empty() {
                     lines.push("Acceptance criteria:".to_string());
                     for ac in &spec.acceptance_criteria {
@@ -194,7 +203,7 @@ pub fn render(f: &mut Frame, app: &App, term_screen: Option<&tui_term::vt100::Sc
                     .borders(Borders::ALL)
                     .title("Task detail")
                     .border_style(Style::default().fg(Color::Yellow));
-                let para = Paragraph::new(lines.join("\n")).block(block);
+                let para = Paragraph::new(lines.join("\n")).block(block).wrap(Wrap { trim: false });
                 f.render_widget(Clear, area);
                 f.render_widget(para, area);
             }
@@ -258,7 +267,7 @@ mod tests {
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
         apply(&root, Intent::CreateTask { title: "Buy milk".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
-        crate::tui::client::Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap(), sessions: vec![] }
+        crate::tui::client::Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap(), sessions: vec![], descriptions: Default::default() }
     }
 
     fn snap_detail() -> crate::tui::client::Snapshot {
@@ -272,7 +281,14 @@ mod tests {
         let mut task = store::load_task(&root, TaskId::new(1)).unwrap();
         task.spec.summary = "from the shop".into();
         store::save_task(&root, &task).unwrap();
-        crate::tui::client::Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap(), sessions: vec![] }
+        // GetBoard loads descriptions from disk; build the same map here so the
+        // detail overlay has prose to render.
+        let mut descriptions = std::collections::BTreeMap::new();
+        descriptions.insert(
+            TaskId::new(1),
+            store::load_description(&root, TaskId::new(1), &task.spec.description_ref).unwrap().unwrap(),
+        );
+        crate::tui::client::Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap(), sessions: vec![], descriptions }
     }
 
     #[test]
@@ -285,6 +301,21 @@ mod tests {
         let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Buy milk"));
         assert!(text.contains("from the shop"));
+    }
+
+    #[test]
+    fn detail_overlay_shows_description() {
+        // create_task seeds description.md with `# <title>`; the detail overlay
+        // must surface it under a Description section.
+        let mut app = App::new(snap_detail());
+        app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE));
+        let backend = TestBackend::new(160, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app, None)).unwrap();
+        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Description:"), "detail overlay should label the description");
+        // the seeded body is the `# Buy milk` heading line
+        assert!(text.contains("# Buy milk"), "detail overlay should render description prose");
     }
 
     #[test]

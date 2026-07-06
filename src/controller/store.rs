@@ -205,6 +205,31 @@ pub fn remove_session_dir(root: &Path, id: TaskId) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn archive_dir(root: &Path) -> PathBuf { root.join("archive/sessions") }
+
+/// Archive a task's session: move its runtime dir out of `sessions/` into
+/// `archive/sessions/<id>/` (keeping the record — session.yaml, state, transcript)
+/// and drop the reproducible `work/` bulk. No-op if there is no session dir.
+pub fn archive_session_dir(root: &Path, id: TaskId) -> anyhow::Result<()> {
+    let src = session_dir(root, id);
+    if !src.exists() {
+        return Ok(());
+    }
+    let dst = archive_dir(root).join(id.to_string());
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if dst.exists() {
+        fs::remove_dir_all(&dst)?; // ids never reuse, but be idempotent
+    }
+    fs::rename(&src, &dst)?;
+    let work = dst.join("work");
+    if work.exists() {
+        fs::remove_dir_all(&work)?;
+    }
+    Ok(())
+}
+
 pub fn load_task(root: &Path, id: TaskId) -> anyhow::Result<Task> {
     let text = fs::read_to_string(task_file(root, id))?;
     Ok(serde_yml::from_str(&text)?)
@@ -446,6 +471,34 @@ mod tests {
         assert!(!session_dir(&root, id).exists());
         // a second call on a missing dir is a no-op, not an error
         remove_session_dir(&root, id).unwrap();
+    }
+
+    #[test]
+    fn archive_moves_session_and_drops_work_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        let id = TaskId::new(1);
+        let sdir = session_dir(&root, id);
+        std::fs::create_dir_all(sdir.join("work/checkout")).unwrap();
+        std::fs::write(sdir.join("session.yaml"), "kind: WorkerSession\n").unwrap();
+        std::fs::write(sdir.join("transcript.jsonl"), "{}\n").unwrap();
+
+        archive_session_dir(&root, id).unwrap();
+
+        assert!(!sdir.exists(), "live session dir removed");
+        let adir = root.join("archive/sessions/task-0001");
+        assert!(adir.join("session.yaml").exists(), "record kept");
+        assert!(adir.join("transcript.jsonl").exists(), "transcript kept");
+        assert!(!adir.join("work").exists(), "reproducible work/ dropped");
+    }
+
+    #[test]
+    fn archive_session_dir_is_noop_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        archive_session_dir(&root, TaskId::new(9)).unwrap(); // must not error
     }
 
     #[test]

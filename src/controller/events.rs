@@ -1,3 +1,4 @@
+use crate::controller::activity::{self, ActivityKind, InterruptionReason};
 use crate::controller::store;
 use crate::model::{Notification, Phase, TaskId, WorkerEvent, WorkerEventKind};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,26 @@ fn to_event(item: &IntakePayload) -> Option<WorkerEvent> {
     })
 }
 
+/// Map a captured hook firing to a human-involvement activity fact. None = the
+/// firing is not a human-involvement event and no activity should be logged.
+/// Steers and interruptions are the observability signals we fold into
+/// context-switch metrics; everything else (session lifecycle, non-blocking
+/// notifications like auth_success) yields None.
+fn to_activity(item: &IntakePayload) -> Option<ActivityKind> {
+    match item.event.as_str() {
+        "user-prompt-submit" => Some(ActivityKind::Steer),
+        "stop" => Some(ActivityKind::Interruption { reason: InterruptionReason::Idle }),
+        "notification" => match item.payload.get("notification_type").and_then(|v| v.as_str()) {
+            Some("permission_prompt") => {
+                Some(ActivityKind::Interruption { reason: InterruptionReason::PermissionPrompt })
+            }
+            Some("idle_prompt") => Some(ActivityKind::Interruption { reason: InterruptionReason::Idle }),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Record a hook firing into the session's state file, overwriting the previous
 /// state. `raw_payload` is Claude's stdin JSON (treated as a bare string if not
 /// valid JSON). Returns true when the event was tracked and the state changed —
@@ -49,6 +70,24 @@ pub fn record_state(root: &Path, id: TaskId, event: &str, raw_payload: &str) -> 
     let payload: serde_json::Value = serde_json::from_str(raw_payload)
         .unwrap_or_else(|_| serde_json::Value::String(raw_payload.to_string()));
     let item = IntakePayload { event: event.to_string(), payload };
+    // Best-effort activity fact: a human-involvement firing (steer/interruption)
+    // is ALSO appended to the root activity log. This must never break state
+    // recording, so any failure is warned and swallowed.
+    if let Some(kind) = to_activity(&item) {
+        let profile = store::load_task(root, id)
+            .ok()
+            .and_then(|t| t.spec.profile)
+            .unwrap_or_else(|| "default".to_string());
+        let ev = activity::ActivityEvent {
+            observed_at: time::OffsetDateTime::now_utc(),
+            task: id,
+            profile,
+            kind,
+        };
+        if let Err(e) = activity::append(root, &ev) {
+            tracing::warn!(error = %e, "failed to append activity event");
+        }
+    }
     match to_event(&item) {
         Some(ev) => {
             store::save_state(root, id, &ev)?;
@@ -190,6 +229,38 @@ mod tests {
         assert!(!tracked); // untracked -> caller should not wake
         // prior Working state must survive an untracked firing
         assert_eq!(store::load_state(&root, id).unwrap().unwrap().kind, WorkerEventKind::Working);
+    }
+
+    #[test]
+    fn permission_prompt_appends_interruption_activity() {
+        use crate::controller::{activity, apply::apply};
+        use crate::model::proto::Intent;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(),
+            column: "todo".parse().unwrap() }).unwrap();
+        let id = TaskId::new(1);
+
+        record_state(&root, id, "notification",
+            "{\"notification_type\":\"permission_prompt\"}").unwrap();
+
+        let acts = activity::load(&root).unwrap();
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0].task, id);
+        assert!(matches!(acts[0].kind,
+            activity::ActivityKind::Interruption {
+                reason: activity::InterruptionReason::PermissionPrompt }));
+    }
+
+    #[test]
+    fn untracked_firing_appends_no_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        record_state(&root, TaskId::new(1), "notification",
+            "{\"notification_type\":\"auth_success\"}").unwrap();
+        assert!(crate::controller::activity::load(&root).unwrap().is_empty());
     }
 
     #[test]

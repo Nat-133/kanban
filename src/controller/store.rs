@@ -222,10 +222,14 @@ pub fn archive_session_dir(root: &Path, id: TaskId) -> anyhow::Result<()> {
     if dst.exists() {
         fs::remove_dir_all(&dst)?; // ids never reuse, but be idempotent
     }
+    // Same filesystem (both under .kanban) => rename is atomic. A cross-mount
+    // src/dst would return EXDEV; not handled (exotic, self-inflicted setup only).
     fs::rename(&src, &dst)?;
     let work = dst.join("work");
     if work.exists() {
-        fs::remove_dir_all(&work)?;
+        if let Err(e) = fs::remove_dir_all(&work) {
+            tracing::warn!(error = %e, "failed to drop archived work/ dir; record is preserved");
+        }
     }
     Ok(())
 }

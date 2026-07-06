@@ -53,6 +53,7 @@ pub fn prepare_session(
     worker_name: &str,
     worker: &WorkerConfig,
     base_dirs: &[String],
+    context: &crate::model::PermissionContext,
 ) -> anyhow::Result<WorkerSession> {
     let id: TaskId = task.metadata.name.parse().map_err(|_| {
         anyhow::anyhow!("task metadata.name is not a valid task id: {}", task.metadata.name)
@@ -128,13 +129,23 @@ pub fn prepare_session(
             }]
         }])
     };
-    let settings = serde_json::json!({ "hooks": {
-        "Notification": mk("notification"),
-        "Stop": mk("stop"),
-        "SessionStart": mk("session-start"),
-        "UserPromptSubmit": mk("user-prompt-submit"),
-        "SessionEnd": mk("session-end"),
-    }});
+    // Permissions are ADDITIVE alongside hooks. mcp/egress are intentionally not
+    // wired here.
+    // TODO(later thread): wire context.mcp into MCP config
+    let settings = serde_json::json!({
+        "permissions": {
+            "allow": context.allow,
+            "ask": context.ask,
+            "deny": context.deny,
+        },
+        "hooks": {
+            "Notification": mk("notification"),
+            "Stop": mk("stop"),
+            "SessionStart": mk("session-start"),
+            "UserPromptSubmit": mk("user-prompt-submit"),
+            "SessionEnd": mk("session-end"),
+        },
+    });
     let settings_path = sdir.join("hooks/settings.json");
     std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
     // inject the flag right after the worker command (index 0)
@@ -186,7 +197,8 @@ pub fn handoff(root: &Path, task_id: TaskId, worker_name: &str, launcher: &dyn L
     let worker = cfg.workers.get(worker_name)
         .ok_or_else(|| anyhow::anyhow!("unknown worker: {worker_name}"))?;
     let mut task = store::load_task(root, task_id)?;
-    let session = prepare_session(root, &task, worker_name, worker, &cfg.agents.base_dirs)?;
+    let context = cfg.context_for(task.spec.profile.as_deref());
+    let session = prepare_session(root, &task, worker_name, worker, &cfg.agents.base_dirs, &context)?;
     let session_name = substitute(&worker.terminal.session_name, &task_id.to_string(), task.spec.repo.as_deref());
     launcher.launch(&session, &session_name)?;
     store::save_session(root, &session)?;
@@ -297,7 +309,8 @@ mod tests {
 
         let cfg = store::load_config(&root).unwrap();
         let worker = cfg.workers.get("claude").unwrap();
-        let session = prepare_session(&root, &task, "claude", worker, &cfg.agents.base_dirs).unwrap();
+        let ctx = crate::model::PermissionContext::builtin_default();
+        let session = prepare_session(&root, &task, "claude", worker, &cfg.agents.base_dirs, &ctx).unwrap();
 
         let sdir = root.join("sessions").join(id.to_string());
         // control-plane files stay at the top; the agent works inside work/
@@ -330,7 +343,8 @@ mod tests {
         task.spec.repo = Some("~/vcs/whatever".into());
         store::save_task(&root, &task).unwrap();
         let cfg = store::load_config(&root).unwrap();
-        let session = prepare_session(&root, &task, "claude", cfg.workers.get("claude").unwrap(), &cfg.agents.base_dirs).unwrap();
+        let ctx = crate::model::PermissionContext::builtin_default();
+        let session = prepare_session(&root, &task, "claude", cfg.workers.get("claude").unwrap(), &cfg.agents.base_dirs, &ctx).unwrap();
 
         let work = session.spec.workspace.join("work").display().to_string();
         let sdir = session.spec.workspace.display().to_string();
@@ -353,7 +367,8 @@ mod tests {
         let task = sample_task(id, "Do the thing");
         store::save_task(&root, &task).unwrap();
         let cfg = store::load_config(&root).unwrap();
-        let session = prepare_session(&root, &task, "claude", cfg.workers.get("claude").unwrap(), &cfg.agents.base_dirs).unwrap();
+        let ctx = crate::model::PermissionContext::builtin_default();
+        let session = prepare_session(&root, &task, "claude", cfg.workers.get("claude").unwrap(), &cfg.agents.base_dirs, &ctx).unwrap();
 
         // Without an initial prompt the worker launches into an idle interactive
         // session: some command arg must point it at its handoff brief.
@@ -377,7 +392,8 @@ mod tests {
         let task = sample_task(id, "x");
         store::save_task(&root, &task).unwrap();
         let cfg = store::load_config(&root).unwrap();
-        let session = prepare_session(&root, &task, "claude", cfg.workers.get("claude").unwrap(), &cfg.agents.base_dirs).unwrap();
+        let ctx = crate::model::PermissionContext::builtin_default();
+        let session = prepare_session(&root, &task, "claude", cfg.workers.get("claude").unwrap(), &cfg.agents.base_dirs, &ctx).unwrap();
 
         let settings = root.join("sessions/task-0001/hooks/settings.json");
         assert!(settings.exists());
@@ -390,6 +406,33 @@ mod tests {
         let settings_canon = std::fs::canonicalize(&settings).unwrap();
         assert_eq!(session.spec.command[idx + 1], settings_canon.display().to_string());
         assert!(settings_canon.is_absolute());
+    }
+
+    #[test]
+    fn prepare_session_bakes_context_permissions_into_settings() {
+        use crate::controller::store;
+        use crate::model::TaskId;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        let id = TaskId::new(1);
+        let task = sample_task(id, "x"); // profile None -> default context
+        store::save_task(&root, &task).unwrap();
+        let cfg = store::load_config(&root).unwrap();
+        let ctx = cfg.context_for(task.spec.profile.as_deref());
+        let session = prepare_session(&root, &task, "claude",
+            cfg.workers.get("claude").unwrap(), &cfg.agents.base_dirs, &ctx).unwrap();
+        let _ = session;
+
+        let settings = root.join("sessions/task-0001/hooks/settings.json");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let allow = v["permissions"]["allow"].as_array().unwrap();
+        assert!(allow.iter().any(|x| x == "Bash"));
+        let ask = v["permissions"]["ask"].as_array().unwrap();
+        assert!(ask.iter().any(|x| x.as_str().unwrap().contains("git push")));
+        // hooks must still be present — permissions are ADDITIVE, not a replacement
+        assert!(v["hooks"]["Stop"].is_array());
     }
 
     #[derive(Default)]

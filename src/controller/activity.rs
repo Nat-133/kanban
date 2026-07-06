@@ -1,5 +1,7 @@
+use crate::controller::store;
 use crate::model::TaskId;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
 /// One immutable human-involvement fact. Append-only; never mutated. Derived
@@ -36,9 +38,86 @@ pub enum InterruptionReason {
     Idle,
 }
 
+pub fn activity_dir(root: &Path) -> PathBuf {
+    root.join("activity")
+}
+
+/// Append one immutable fact. Filename = nanos-pid so it is time-ordered and
+/// unique across the hook and daemon processes; never overwrites an existing file.
+pub fn append(root: &Path, event: &ActivityEvent) -> anyhow::Result<()> {
+    let nanos = event.observed_at.unix_timestamp_nanos();
+    let pid = std::process::id();
+    let name = format!("{nanos:020}-{pid}.json");
+    let path = activity_dir(root).join(name);
+    store::atomic_write(&path, &serde_json::to_string(event)?)
+}
+
+/// Load every fact, ascending by filename (i.e. by time). Missing dir => empty.
+pub fn load(root: &Path) -> anyhow::Result<Vec<ActivityEvent>> {
+    let dir = activity_dir(root);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut names: Vec<_> = std::fs::read_dir(&dir)?
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .filter(|n| n.to_string_lossy().ends_with(".json"))
+        .collect();
+    names.sort();
+    let mut out = Vec::new();
+    for n in names {
+        let text = std::fs::read_to_string(dir.join(&n))?;
+        out.push(serde_json::from_str(&text)?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_then_load_returns_events_in_time_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        std::fs::create_dir_all(&root).unwrap();
+        let mk = |secs: i64, task: u32| ActivityEvent {
+            observed_at: time::OffsetDateTime::from_unix_timestamp(secs).unwrap(),
+            task: TaskId::new(task),
+            profile: "default".into(),
+            kind: ActivityKind::Steer,
+        };
+        append(&root, &mk(200, 2)).unwrap();
+        append(&root, &mk(100, 1)).unwrap();
+        let all = load(&root).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].observed_at.unix_timestamp(), 100, "sorted ascending by time");
+        assert_eq!(all[1].task, TaskId::new(2));
+    }
+
+    #[test]
+    fn load_is_empty_when_no_activity_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn profile_changed_event_survives_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        std::fs::create_dir_all(&root).unwrap();
+        let e = ActivityEvent {
+            observed_at: time::OffsetDateTime::from_unix_timestamp(300).unwrap(),
+            task: TaskId::new(7),
+            profile: "careful".into(),
+            kind: ActivityKind::ProfileChanged {
+                from: Some("default".into()),
+                to: "careful".into(),
+            },
+        };
+        append(&root, &e).unwrap();
+        let all = load(&root).unwrap();
+        assert_eq!(all, vec![e]);
+    }
 
     #[test]
     fn activity_event_round_trips_json() {

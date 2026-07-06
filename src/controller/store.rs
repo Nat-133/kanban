@@ -183,6 +183,18 @@ pub fn load_task(root: &Path, id: TaskId) -> anyhow::Result<Task> {
     Ok(serde_yml::from_str(&text)?)
 }
 
+/// Read a task's long-form description — the `description_ref` file within the
+/// task dir. Returns `None` when the file does not exist yet (a task may never
+/// have had a description written), so the caller can distinguish "no file"
+/// from "empty file".
+pub fn load_description(root: &Path, id: TaskId, description_ref: &str) -> anyhow::Result<Option<String>> {
+    let p = task_dir(root, id).join(description_ref);
+    if !p.exists() {
+        return Ok(None);
+    }
+    Ok(Some(fs::read_to_string(&p)?))
+}
+
 pub fn save_task(root: &Path, task: &Task) -> anyhow::Result<()> {
     let id: TaskId = task.metadata.name.parse()
         .map_err(|_| anyhow::anyhow!("task metadata.name is not a valid task id: {}", task.metadata.name))?;

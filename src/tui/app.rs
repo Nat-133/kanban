@@ -167,6 +167,12 @@ impl App {
         self.snapshot.tasks.iter().find(|t| t.metadata.name == name)
     }
 
+    /// The currently selected task's long-form description, if it has one.
+    pub fn detail_description(&self) -> Option<&str> {
+        let id = self.selected_task()?;
+        self.snapshot.descriptions.get(&id).map(String::as_str)
+    }
+
     fn clamp(&mut self) {
         let ncols = self.columns().len();
         if ncols == 0 {
@@ -448,7 +454,7 @@ mod tests {
         store::init_workspace(&root).unwrap();
         apply(&root, Intent::CreateTask { title: "First".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
         apply(&root, Intent::CreateTask { title: "Second".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
-        Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap(), sessions: vec![] }
+        Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap(), sessions: vec![], descriptions: Default::default() }
     }
 
     #[test]

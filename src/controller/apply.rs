@@ -204,7 +204,7 @@ fn archive(root: &Path, task_id: TaskId, launcher: &dyn handoff::Launcher) -> an
 ///
 /// The profile update is the durable state change; the `ProfileChanged` fact is
 /// observability, so its append is best-effort (warned and swallowed on failure),
-/// consistent with the human-involvement facts emitted in `events::ingest_session`.
+/// consistent with the human-involvement facts emitted in `events::record_state`.
 fn set_profile(root: &Path, task_id: TaskId, profile: String) -> anyhow::Result<Response> {
     if !store::task_dir(root, task_id).exists() {
         return Ok(Response::Error { message: format!("task not found: {task_id}") });
@@ -414,8 +414,11 @@ mod tests {
 
         assert_eq!(store::load_task(&root, id).unwrap().spec.profile.as_deref(), Some("cluster-ops"));
         let acts = activity::load(&root).unwrap();
+        // Assert the full None -> Some transition: `from` must be the OLD value
+        // (None on a fresh task), which pins the "capture from before mutating" contract.
         assert!(acts.iter().any(|a| matches!(&a.kind,
-            activity::ActivityKind::ProfileChanged { to, .. } if to == "cluster-ops")));
+            activity::ActivityKind::ProfileChanged { from, to }
+                if from.is_none() && to == "cluster-ops")));
     }
 
     #[test]

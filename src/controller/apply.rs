@@ -363,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_flags_task_kills_session_and_removes_session_dir() {
+    fn archive_flags_task_kills_session_and_archives_session_dir() {
         let d = setup(); let r = root(&d);
         apply(&r, Intent::CreateTask { title: "A".into(), summary: "".into(), column: col("todo") }).unwrap();
         let id = TaskId::new(1);
@@ -378,7 +378,9 @@ mod tests {
         assert!(store::load_task(&r, id).unwrap().status.archived);
         let board = store::load_board(&r).unwrap();
         assert!(board.cards().values().all(|v| v.is_empty()));
-        assert!(!store::session_dir(&r, id).exists(), "session dir should be removed");
+        assert!(!store::session_dir(&r, id).exists(), "session dir should be archived out of sessions/");
+        assert!(store::archive_dir(&r).join(id.to_string()).join("session.yaml").exists(),
+            "archived session record should be preserved under archive/sessions/");
         assert_eq!(&*fake.killed.lock().unwrap(), &["kanban-task-0001".to_string()]);
     }
 

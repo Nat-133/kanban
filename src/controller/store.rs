@@ -36,7 +36,30 @@ pub fn load_config(root: &Path) -> anyhow::Result<Config> {
 }
 
 fn default_config_yaml() -> &'static str {
-    "agents:\n  baseDirs:\n    - ~/vcs/*\nworkers:\n  claude:\n    command: claude\n    args:\n      - --add-dir\n      - .kanban/sessions/{task_id}/work\n    workdir: \"{repo}\"\n    terminal:\n      type: tmux\n      sessionName: kanban-{task_id}\n"
+    r#"agents:
+  baseDirs:
+    - ~/vcs/*
+workers:
+  claude:
+    command: claude
+    args:
+      - --add-dir
+      - .kanban/sessions/{task_id}/work
+    workdir: "{repo}"
+    terminal:
+      type: tmux
+      sessionName: kanban-{task_id}
+contexts:
+  default:
+    allow: [Bash, Edit, Write, Read, Glob, Grep, WebFetch, WebSearch]
+    ask:
+      - Bash(git push:*)
+      - Bash(git push --force:*)
+      - Bash(gh pr create:*)
+      - Bash(gh pr merge:*)
+      - Bash(gh pr review:*)
+    # egress: RESERVED — not enforced yet (needs the worker network sandbox).
+"#
 }
 
 pub fn load_board(root: &Path) -> anyhow::Result<Board> {
@@ -428,6 +451,17 @@ mod tests {
         init_workspace(&root).unwrap();
         let cfg = load_config(&root).unwrap();
         assert!(cfg.workers.contains_key("claude"));
+    }
+
+    #[test]
+    fn init_writes_default_permission_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        let cfg = load_config(&root).unwrap();
+        let c = cfg.contexts.get("default").expect("default context present");
+        assert!(c.allow.iter().any(|p| p.starts_with("Bash")));
+        assert!(c.ask.iter().any(|p| p.contains("git push")));
     }
 
     fn sample_task(id: TaskId, title: &str) -> Task {

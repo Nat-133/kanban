@@ -68,20 +68,28 @@ pub fn render(f: &mut Frame, app: &App, term_screen: Option<&tui_term::vt100::Sc
                     if has_jira(app, *task) {
                         title = format!("{title} [J]");
                     }
+                    let selected = selected_col && app.selected_row() == row;
                     // Leading status icon: spinner while working, warning when it
                     // needs a human, nothing otherwise. A fixed two-cell prefix
-                    // keeps titles aligned across all cards.
+                    // keeps titles aligned across all cards. The warning is red,
+                    // but on the highlighted card REVERSED would turn that red
+                    // into a red background, so drop the colour when selected.
                     let icon = match app.session_for(*task).map(|s| s.phase) {
                         Some(Phase::Working) => {
                             Span::raw(format!("{} ", spinner_frame(app.spinner_tick())))
                         }
                         Some(Phase::Idle | Phase::WaitingHuman | Phase::Failed) => {
-                            Span::styled(format!("{WARNING} "), Style::default().fg(Color::Red))
+                            let icon_style = if selected {
+                                Style::default()
+                            } else {
+                                Style::default().fg(Color::Red)
+                            };
+                            Span::styled(format!("{WARNING} "), icon_style)
                         }
                         _ => Span::raw("  "),
                     };
                     let mut style = Style::default();
-                    if selected_col && app.selected_row() == row {
+                    if selected {
                         style = style.add_modifier(Modifier::REVERSED);
                     }
                     ListItem::new(Line::from(vec![icon, Span::raw(title)])).style(style)

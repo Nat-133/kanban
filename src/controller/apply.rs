@@ -86,6 +86,7 @@ fn create_task(root: &Path, title: String, summary: String, column: ColumnId) ->
             repo: None,
             jira: Default::default(),
             context: Default::default(),
+            profile: None,
         },
         status: Default::default(),
     };

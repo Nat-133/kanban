@@ -185,7 +185,7 @@ fn archive(root: &Path, task_id: TaskId, launcher: &dyn handoff::Launcher) -> an
             launcher.kill(name);
         }
     }
-    store::remove_session_dir(root, task_id)?;
+    store::archive_session_dir(root, task_id)?;
     // Flag the task archived (kept on disk, hidden from the board)…
     task.status.archived = true;
     store::save_task(root, &task)?;

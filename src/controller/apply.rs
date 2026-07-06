@@ -1,5 +1,6 @@
 // intent application — Task 4
 
+use crate::controller::activity;
 use crate::controller::handoff;
 use crate::controller::store;
 use crate::model::proto::{Intent, Response};
@@ -50,6 +51,7 @@ pub fn apply(root: &Path, intent: Intent) -> anyhow::Result<Response> {
         Intent::MoveCard { task, to_column, position } => move_card(root, task, to_column, position),
         Intent::ReorderCard { task, position } => reorder_card(root, task, position),
         Intent::ArchiveTask { task } => archive(root, task, &handoff::TmuxLauncher),
+        Intent::SetProfile { task, profile } => set_profile(root, task, profile),
         Intent::Handoff { task, worker } => {
             match handoff::handoff(root, task, &worker, &handoff::TmuxLauncher) {
                 Ok(()) => Ok(Response::Ok { task: Some(task) }),
@@ -195,6 +197,33 @@ fn archive(root: &Path, task_id: TaskId, launcher: &dyn handoff::Launcher) -> an
         Err(e) => return Ok(Response::Error { message: e.to_string() }),
     };
     store::save_board(root, &board)?;
+    Ok(Response::Ok { task: Some(task_id) })
+}
+
+/// Set a task's active profile and record the change as an activity fact.
+///
+/// The profile update is the durable state change; the `ProfileChanged` fact is
+/// observability, so its append is best-effort (warned and swallowed on failure),
+/// consistent with the human-involvement facts emitted in `events::ingest_session`.
+fn set_profile(root: &Path, task_id: TaskId, profile: String) -> anyhow::Result<Response> {
+    if !store::task_dir(root, task_id).exists() {
+        return Ok(Response::Error { message: format!("task not found: {task_id}") });
+    }
+    let mut task = store::load_task(root, task_id)?;
+    // Capture the previous profile BEFORE mutating so the fact records the transition.
+    let from = task.spec.profile.clone();
+    task.spec.profile = Some(profile.clone());
+    store::save_task(root, &task)?;
+    let ev = activity::ActivityEvent {
+        observed_at: time::OffsetDateTime::now_utc(),
+        task: task_id,
+        // The new profile is the active one at emit time.
+        profile: profile.clone(),
+        kind: activity::ActivityKind::ProfileChanged { from, to: profile },
+    };
+    if let Err(e) = activity::append(root, &ev) {
+        tracing::warn!(error = %e, "failed to append profileChanged activity event");
+    }
     Ok(Response::Ok { task: Some(task_id) })
 }
 
@@ -368,6 +397,25 @@ mod tests {
             }
             other => panic!("expected snapshot, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn set_profile_updates_task_and_logs_profile_changed() {
+        use crate::controller::activity;
+        use crate::model::proto::Intent;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(),
+            column: "todo".parse().unwrap() }).unwrap();
+        let id = TaskId::new(1);
+
+        apply(&root, Intent::SetProfile { task: id, profile: "cluster-ops".into() }).unwrap();
+
+        assert_eq!(store::load_task(&root, id).unwrap().spec.profile.as_deref(), Some("cluster-ops"));
+        let acts = activity::load(&root).unwrap();
+        assert!(acts.iter().any(|a| matches!(&a.kind,
+            activity::ActivityKind::ProfileChanged { to, .. } if to == "cluster-ops")));
     }
 
     #[test]

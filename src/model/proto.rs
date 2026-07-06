@@ -17,6 +17,7 @@ pub enum Intent {
     ReorderCard { task: TaskId, position: usize },
     ArchiveTask { task: TaskId },
     Handoff { task: TaskId, worker: String },
+    SetProfile { task: TaskId, profile: String },
 }
 
 /// Replies the controller sends back.
@@ -81,6 +82,13 @@ mod tests {
     #[test]
     fn handoff_intent_round_trips() {
         let i = Intent::Handoff { task: TaskId::new(1), worker: "claude".into() };
+        let back: Intent = serde_json::from_str(&serde_json::to_string(&i).unwrap()).unwrap();
+        assert_eq!(i, back);
+    }
+
+    #[test]
+    fn set_profile_intent_round_trips() {
+        let i = Intent::SetProfile { task: TaskId::new(1), profile: "cluster-ops".into() };
         let back: Intent = serde_json::from_str(&serde_json::to_string(&i).unwrap()).unwrap();
         assert_eq!(i, back);
     }

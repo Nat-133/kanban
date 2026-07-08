@@ -3,7 +3,8 @@
 use crate::model::proto::Intent;
 use crate::model::{Column, ColumnId, Task, TaskId};
 use crate::tui::client::Snapshot;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui_textarea::TextArea;
 
 /// The result of handling a key: nothing, quit the loop, or send an intent.
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +27,8 @@ pub enum Mode {
     Search,
     Help,
     Detail,
+    /// Multi-line editor for the selected task's long-form description.
+    EditDescription,
     /// The embedded terminal popup is open; key input is routed to the PTY.
     Terminal,
 }
@@ -40,6 +43,12 @@ pub struct App {
     input: String,
     filter: String,
     editing: Option<TaskId>,
+    /// The multi-line description editor, present only in `EditDescription` mode.
+    editor: Option<TextArea<'static>>,
+    /// Content the open description editor was seeded from — the optimistic-
+    /// concurrency base sent with the edit so the controller can detect a
+    /// concurrent write. `None` when the task had no description file.
+    desc_base: Option<String>,
     pub status: Option<String>,
     /// Render-tick counter driving the `Working` spinner animation.
     tick: u64,
@@ -55,6 +64,8 @@ impl App {
             input: String::new(),
             filter: String::new(),
             editing: None,
+            editor: None,
+            desc_base: None,
             status: None,
             tick: 0,
         }
@@ -192,6 +203,7 @@ impl App {
             Mode::EditTask => self.on_edit(key),
             Mode::Search => self.on_search(key),
             Mode::Detail => self.on_detail(key),
+            Mode::EditDescription => self.on_edit_description(key),
             Mode::Help => {
                 self.mode = Mode::Normal;
                 Action::None
@@ -214,12 +226,90 @@ impl App {
 
     fn on_detail(&mut self, key: KeyEvent) -> Action {
         match key.code {
+            // Open the multi-line editor on the task's long-form description.
+            KeyCode::Char('e') => self.open_description_editor(),
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                 self.mode = Mode::Normal;
             }
             _ => {}
         }
         Action::None
+    }
+
+    /// Enter `EditDescription` mode, seeding the editor from the selected task's
+    /// current description and recording that content as the concurrency base.
+    fn open_description_editor(&mut self) {
+        let Some(task) = self.selected_task() else { return };
+        let base = self.detail_description().map(str::to_string);
+        // Seed the buffer faithfully: split on '\n' so a trailing newline shows
+        // as a final empty line and the text round-trips exactly. An absent
+        // description starts as a single empty line.
+        let lines: Vec<String> = match &base {
+            Some(s) => s.split('\n').map(str::to_string).collect(),
+            None => vec![String::new()],
+        };
+        self.editor = Some(TextArea::new(lines));
+        self.desc_base = base;
+        self.editing = Some(task);
+        self.mode = Mode::EditDescription;
+    }
+
+    /// The current text of the open description editor (lines rejoined). `None`
+    /// when no editor is open.
+    pub fn description_editor_text(&self) -> Option<String> {
+        self.editor.as_ref().map(|e| e.lines().join("\n"))
+    }
+
+    /// The open description editor widget, for rendering. `None` unless in
+    /// `EditDescription` mode.
+    pub fn description_editor(&self) -> Option<&TextArea<'static>> {
+        self.editor.as_ref()
+    }
+
+    /// Close the description editor and return to the board. Called by the run
+    /// loop once the controller confirms the write (`Response::Ok`).
+    pub fn close_description_editor(&mut self) {
+        if matches!(self.mode, Mode::EditDescription) {
+            self.mode = Mode::Normal;
+        }
+        self.editor = None;
+        self.editing = None;
+        self.desc_base = None;
+    }
+
+    /// Handle a rejected description write: the file changed under us. Keep the
+    /// user's buffer, rebase the concurrency base onto the now-current content so
+    /// a second `Ctrl+S` overwrites it deliberately, and warn.
+    pub fn on_description_conflict(&mut self, current: Option<String>) {
+        self.desc_base = current;
+        self.status =
+            Some("description changed on disk — Ctrl+S again to overwrite, Esc to discard".into());
+    }
+
+    fn on_edit_description(&mut self, key: KeyEvent) -> Action {
+        // Ctrl+S commits; the editor stays open until the run loop learns the
+        // write's fate, so a conflict can restore the buffer.
+        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            let Some(task) = self.editing else { return Action::None };
+            let description = self.description_editor_text().unwrap_or_default();
+            return Action::Send(Intent::EditDescription {
+                task,
+                base: self.desc_base.clone(),
+                description,
+            });
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.close_description_editor();
+                Action::None
+            }
+            _ => {
+                if let Some(e) = self.editor.as_mut() {
+                    e.input(key);
+                }
+                Action::None
+            }
+        }
     }
 
     fn on_normal(&mut self, key: KeyEvent) -> Action {
@@ -621,6 +711,90 @@ mod tests {
         let action = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(action, Action::Send(Intent::EditTask { task: TaskId::new(1), title: Some("New".into()), summary: None }));
         assert!(matches!(app.mode(), Mode::Normal));
+    }
+
+    fn ctrl(c: char) -> KeyEvent { KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL) }
+
+    // snapshot where task-0001 has a known long-form description on record.
+    fn snap_with_desc(desc: &str) -> Snapshot {
+        let mut s = snap();
+        s.descriptions.insert(TaskId::new(1), desc.to_string());
+        s
+    }
+
+    #[test]
+    fn e_in_detail_opens_description_editor_seeded_with_current() {
+        let mut app = App::new(snap_with_desc("# A\nline two\n"));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // -> Detail (task-0001)
+        assert!(matches!(app.mode(), Mode::Detail));
+        app.on_key(key('e')); // -> edit description
+        assert!(matches!(app.mode(), Mode::EditDescription));
+        assert_eq!(app.description_editor_text().as_deref(), Some("# A\nline two\n"));
+    }
+
+    #[test]
+    fn ctrl_s_emits_edit_description_and_keeps_editor_open() {
+        let mut app = App::new(snap_with_desc("# A\n"));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(key('e'));
+        app.on_key(key('X')); // type into the buffer
+        let action = app.on_key(ctrl('s'));
+        match action {
+            Action::Send(Intent::EditDescription { task, base, description }) => {
+                assert_eq!(task, TaskId::new(1));
+                assert_eq!(base, Some("# A\n".into()), "base must be exactly what was seeded");
+                assert!(description.contains('X'), "edited buffer should be sent");
+            }
+            o => panic!("expected EditDescription, got {o:?}"),
+        }
+        // editor stays open until the server confirms — so a conflict can restore it
+        assert!(matches!(app.mode(), Mode::EditDescription));
+    }
+
+    #[test]
+    fn esc_cancels_description_editor() {
+        let mut app = App::new(snap_with_desc("# A\n"));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(key('e'));
+        let action = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(action, Action::None);
+        assert!(matches!(app.mode(), Mode::Normal));
+        assert!(app.description_editor_text().is_none());
+    }
+
+    #[test]
+    fn close_description_editor_returns_to_board() {
+        let mut app = App::new(snap_with_desc("# A\n"));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(key('e'));
+        app.on_key(ctrl('s')); // save keeps it open
+        app.close_description_editor(); // run loop calls this on Response::Ok
+        assert!(matches!(app.mode(), Mode::Normal));
+        assert!(app.description_editor_text().is_none());
+    }
+
+    #[test]
+    fn description_conflict_rebases_keeps_buffer_and_warns() {
+        let mut app = App::new(snap_with_desc("# A\n"));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(key('e'));
+        app.on_key(key('X'));
+        let saved = match app.on_key(ctrl('s')) {
+            Action::Send(Intent::EditDescription { description, .. }) => description,
+            o => panic!("expected EditDescription, got {o:?}"),
+        };
+        // server says someone else wrote it meanwhile
+        app.on_description_conflict(Some("# A\nother worker\n".into()));
+        // still editing, buffer preserved, base rebased so a re-save wins, warning shown
+        assert!(matches!(app.mode(), Mode::EditDescription));
+        assert_eq!(app.description_editor_text().as_deref(), Some(saved.as_str()));
+        assert!(app.status.as_deref().unwrap_or("").to_lowercase().contains("disk"));
+        let action = app.on_key(ctrl('s'));
+        match action {
+            Action::Send(Intent::EditDescription { base, .. }) =>
+                assert_eq!(base, Some("# A\nother worker\n".into()), "re-save must be based on the new on-disk content"),
+            o => panic!("expected EditDescription, got {o:?}"),
+        }
     }
 
     #[test]

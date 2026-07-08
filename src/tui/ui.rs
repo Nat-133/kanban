@@ -142,6 +142,7 @@ pub fn render(f: &mut Frame, app: &App, term_screen: Option<&tui_term::vt100::Sc
                 "  H / L        move card to prev / next column",
                 "  J / K        reorder card down / up",
                 "  a            add task",
+                "  Enter        open task detail (e edits description)",
                 "  c            hand off selected task",
                 "  d            archive selected task",
                 "  ?            toggle this help",
@@ -195,7 +196,7 @@ pub fn render(f: &mut Frame, app: &App, term_screen: Option<&tui_term::vt100::Sc
                     lines.push(format!("Jira URL: {url}"));
                 }
                 lines.push(String::new());
-                lines.push("Press Esc / Enter / q to close.".to_string());
+                lines.push("Press e to edit description · Esc / Enter / q to close.".to_string());
 
                 let height = lines.len() as u16 + 2;
                 let area = centered_rect(60, height, f.area());
@@ -206,6 +207,33 @@ pub fn render(f: &mut Frame, app: &App, term_screen: Option<&tui_term::vt100::Sc
                 let para = Paragraph::new(lines.join("\n")).block(block).wrap(Wrap { trim: false });
                 f.render_widget(Clear, area);
                 f.render_widget(para, area);
+            }
+        }
+        Mode::EditDescription => {
+            if let Some(editor) = app.description_editor() {
+                let title = app
+                    .detail_task()
+                    .map(|t| format!("Edit description — {}", t.spec.title))
+                    .unwrap_or_else(|| "Edit description".to_string());
+                // A tall overlay: descriptions are long-form prose.
+                let height = (f.area().height.saturating_mul(60) / 100).max(3);
+                let area = centered_rect(70, height, f.area());
+                let mut block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .title_bottom("Ctrl+S save · Esc cancel")
+                    .border_style(Style::default().fg(Color::Yellow));
+                // Surface a conflict / error warning along the bottom border, in red.
+                if let Some(status) = &app.status {
+                    block = block.title_bottom(Span::styled(
+                        format!(" {status} "),
+                        Style::default().fg(Color::Red),
+                    ));
+                }
+                let inner = block.inner(area);
+                f.render_widget(Clear, area);
+                f.render_widget(block, area);
+                f.render_widget(editor, inner);
             }
         }
         Mode::Terminal => {
@@ -316,6 +344,22 @@ mod tests {
         assert!(text.contains("Description:"), "detail overlay should label the description");
         // the seeded body is the `# Buy milk` heading line
         assert!(text.contains("# Buy milk"), "detail overlay should render description prose");
+    }
+
+    #[test]
+    fn edit_description_overlay_renders_editor_with_seeded_text_and_hint() {
+        use crate::model::TaskId;
+        let mut s = snap_detail(); // task-0001 with a seeded description ("# Buy milk\n")
+        s.descriptions.insert(TaskId::new(1), "# Buy milk\nbody text".into());
+        let mut app = App::new(s);
+        app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE)); // Detail
+        app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('e'), crossterm::event::KeyModifiers::NONE)); // EditDescription
+        let backend = TestBackend::new(160, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app, None)).unwrap();
+        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("body text"), "editor should show the seeded description");
+        assert!(text.contains("Ctrl+S"), "overlay should hint how to save");
     }
 
     #[test]

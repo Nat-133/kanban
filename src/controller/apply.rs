@@ -48,6 +48,7 @@ pub fn apply(root: &Path, intent: Intent) -> anyhow::Result<Response> {
         }
         Intent::CreateTask { title, summary, column } => create_task(root, title, summary, column),
         Intent::EditTask { task, title, summary } => edit_task(root, task, title, summary),
+        Intent::EditDescription { task, base, description } => edit_description(root, task, base, description),
         Intent::MoveCard { task, to_column, position } => move_card(root, task, to_column, position),
         Intent::ReorderCard { task, position } => reorder_card(root, task, position),
         Intent::ArchiveTask { task } => archive(root, task, &handoff::TmuxLauncher),
@@ -121,6 +122,27 @@ fn edit_task(root: &Path, task_id: TaskId, title: Option<String>, summary: Optio
         task.spec.summary = summary;
     }
     store::save_task(root, &task)?;
+    Ok(Response::Ok { task: Some(task_id) })
+}
+
+/// Replace a task's long-form description, guarded by an optimistic-concurrency
+/// check. `base` is what the caller last saw; if the on-disk content diverged
+/// (a worker or external editor wrote it meanwhile), reject with the current
+/// content rather than clobbering it. Content flows through the intent so the
+/// client never needs the workspace path.
+fn edit_description(root: &Path, task_id: TaskId, base: Option<String>, description: String) -> anyhow::Result<Response> {
+    if !store::task_dir(root, task_id).exists() {
+        return Ok(Response::Error { message: format!("task not found: {task_id}") });
+    }
+    let task = store::load_task(root, task_id)?;
+    let current = store::load_description(root, task_id, &task.spec.description_ref)?;
+    if current != base {
+        return Ok(Response::Conflict { current });
+    }
+    store::atomic_write(
+        &store::task_dir(root, task_id).join(&task.spec.description_ref),
+        &description,
+    )?;
     Ok(Response::Ok { task: Some(task_id) })
 }
 
@@ -315,6 +337,47 @@ mod tests {
         let t = crate::controller::store::load_task(&r, TaskId::new(1)).unwrap();
         assert_eq!(t.spec.title, "B");
         assert_eq!(t.spec.summary, "s"); // unchanged
+    }
+
+    #[test]
+    fn edit_description_writes_when_base_matches() {
+        let d = setup(); let r = root(&d);
+        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
+        // create seeds "# A\n"; edit from that exact base
+        let resp = apply(&r, Intent::EditDescription {
+            task: TaskId::new(1),
+            base: Some("# A\n".into()),
+            description: "# A\nnew body\n".into(),
+        }).unwrap();
+        assert_eq!(resp, Response::Ok { task: Some(TaskId::new(1)) });
+        let desc = store::load_description(&r, TaskId::new(1), "description.md").unwrap();
+        assert_eq!(desc.as_deref(), Some("# A\nnew body\n"));
+    }
+
+    #[test]
+    fn edit_description_conflict_when_base_is_stale() {
+        let d = setup(); let r = root(&d);
+        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
+        // base does not match what's on disk ("# A\n") -> reject, return current, leave file untouched
+        let resp = apply(&r, Intent::EditDescription {
+            task: TaskId::new(1),
+            base: Some("something else".into()),
+            description: "clobber".into(),
+        }).unwrap();
+        assert_eq!(resp, Response::Conflict { current: Some("# A\n".into()) });
+        let desc = store::load_description(&r, TaskId::new(1), "description.md").unwrap();
+        assert_eq!(desc.as_deref(), Some("# A\n"), "conflicting write must not touch the file");
+    }
+
+    #[test]
+    fn edit_description_missing_task_errors() {
+        let d = setup(); let r = root(&d);
+        let resp = apply(&r, Intent::EditDescription {
+            task: TaskId::new(99),
+            base: None,
+            description: "x".into(),
+        }).unwrap();
+        assert!(matches!(resp, Response::Error { .. }));
     }
 
     #[test]

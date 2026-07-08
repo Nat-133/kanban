@@ -13,6 +13,11 @@ pub enum Intent {
     GetBoard,
     CreateTask { title: String, summary: String, column: ColumnId },
     EditTask { task: TaskId, title: Option<String>, summary: Option<String> },
+    /// Replace a task's long-form `description.md`. `base` is the content the
+    /// editor was seeded from (`None` if the task had no description file); the
+    /// controller rejects the write with `Response::Conflict` when the on-disk
+    /// content no longer equals `base` (i.e. it changed under us).
+    EditDescription { task: TaskId, base: Option<String>, description: String },
     MoveCard { task: TaskId, to_column: ColumnId, position: Option<usize> },
     ReorderCard { task: TaskId, position: usize },
     ArchiveTask { task: TaskId },
@@ -38,6 +43,10 @@ pub enum Response {
     /// A mutation succeeded; carries the affected task id when relevant.
     Ok { task: Option<TaskId> },
     Error { message: String },
+    /// An optimistic-concurrency write was rejected because the target changed
+    /// under the caller. `current` is the content now on disk (`None` if the
+    /// file is absent), so the client can reconcile without a round-trip.
+    Conflict { current: Option<String> },
 }
 
 /// Body of a `/v1/wake` request: the hook telling the controller that a session's
@@ -112,6 +121,26 @@ mod tests {
     #[test]
     fn response_error_round_trips() {
         let r = Response::Error { message: "nope".into() };
+        let back: Response = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(r, back);
+    }
+
+    #[test]
+    fn edit_description_intent_round_trips() {
+        let i = Intent::EditDescription {
+            task: TaskId::new(3),
+            base: Some("# old\n".into()),
+            description: "# new\nbody".into(),
+        };
+        let j = serde_json::to_string(&i).unwrap();
+        let back: Intent = serde_json::from_str(&j).unwrap();
+        assert_eq!(i, back);
+        assert!(j.contains("\"type\":\"editDescription\""));
+    }
+
+    #[test]
+    fn conflict_response_round_trips() {
+        let r = Response::Conflict { current: Some("# on disk\n".into()) };
         let back: Response = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert_eq!(r, back);
     }

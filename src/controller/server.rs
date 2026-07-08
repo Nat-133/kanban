@@ -102,7 +102,10 @@ async fn handle_intent(State(state): State<AppState>, Json(intent): Json<Intent>
         Ok(Err(e)) => Response::Error { message: e.to_string() },
         Err(join_err) => Response::Error { message: format!("internal task error: {join_err}") },
     };
-    if is_mutation && !matches!(resp, Response::Error { .. }) {
+    // Only announce a change when a mutation actually succeeded — a rejected
+    // write (Error, or a Conflict from the optimistic-concurrency check) changed
+    // nothing, so waking subscribers to re-fetch would be a phantom refresh.
+    if is_mutation && matches!(resp, Response::Ok { .. }) {
         let _ = state.changes.send(()); // ignore "no subscribers"
     }
     Json(resp)
@@ -306,6 +309,35 @@ mod tests {
         let snap: Response = client.post(&url).json(&Intent::GetBoard)
             .send().await.unwrap().json().await.unwrap();
         match snap { Response::Snapshot { tasks, .. } => assert_eq!(tasks.len(), 1), o => panic!("{o:?}") }
+    }
+
+    #[tokio::test]
+    async fn edit_description_conflict_travels_back_over_http() {
+        // The optimistic-concurrency rejection must survive JSON round-tripping so
+        // the TUI's run loop can act on it. A stale `base` -> `Response::Conflict`
+        // carrying the current on-disk content.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        crate::controller::store::init_workspace(&root).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(root.clone(), tokio::sync::broadcast::channel(64).0);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/v1/intent");
+        client.post(&url)
+            .json(&Intent::CreateTask { title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() })
+            .send().await.unwrap();
+
+        let resp: Response = client.post(&url)
+            .json(&Intent::EditDescription {
+                task: crate::model::TaskId::new(1),
+                base: Some("stale".into()), // create seeded "# A\n", so this is stale
+                description: "clobber".into(),
+            })
+            .send().await.unwrap().json().await.unwrap();
+        assert_eq!(resp, Response::Conflict { current: Some("# A\n".into()) });
     }
 
     #[tokio::test]

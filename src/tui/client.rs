@@ -39,6 +39,7 @@ impl Client {
             Response::Snapshot { board, tasks, sessions, descriptions } => Ok(Snapshot { board, tasks, sessions, descriptions }),
             Response::Error { message } => Err(anyhow::anyhow!(message)),
             Response::Ok { .. } => Err(anyhow::anyhow!("unexpected Ok response to GetBoard")),
+            Response::Conflict { .. } => Err(anyhow::anyhow!("unexpected Conflict response to GetBoard")),
         }
     }
 }

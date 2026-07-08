@@ -1,5 +1,6 @@
 // async event loop — Task 5
 
+use crate::model::proto::Response;
 use crate::tui::app::{Action, App, Mode};
 use crate::tui::client::Client;
 use crate::tui::term::{handle_prefixed_key, popup_pty_size, TermAction, TermSession};
@@ -134,8 +135,26 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                             match app.on_key(key) {
                                 Action::Quit => break,
                                 Action::Send(intent) => {
+                                    // Inspect the controller's reply, not just the
+                                    // transport result: a `Response::Error`/`Conflict`
+                                    // arrives as `Ok(resp)`, so matching on `Ok(_)`
+                                    // would silently treat a rejection as success.
                                     match client.send(intent).await {
-                                        Ok(_) => refresh(&client, &mut app).await,
+                                        Ok(Response::Ok { .. }) => {
+                                            // A committed description edit closes its
+                                            // editor; a no-op for every other intent.
+                                            app.close_description_editor();
+                                            refresh(&client, &mut app).await;
+                                        }
+                                        Ok(Response::Conflict { current }) => {
+                                            app.on_description_conflict(current);
+                                        }
+                                        Ok(Response::Error { message }) => {
+                                            app.status = Some(message);
+                                        }
+                                        Ok(Response::Snapshot { .. }) => {
+                                            refresh(&client, &mut app).await;
+                                        }
                                         Err(e) => app.status = Some(e.to_string()),
                                     }
                                 }

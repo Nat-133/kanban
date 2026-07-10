@@ -135,6 +135,13 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                             match app.on_key(key) {
                                 Action::Quit => break,
                                 Action::Send(intent) => {
+                                    // A handoff pops the operator straight into the
+                                    // new session's terminal to drive scoping; note
+                                    // its task before the intent is moved into send.
+                                    let handoff_task = match &intent {
+                                        crate::model::proto::Intent::Handoff { task, .. } => Some(*task),
+                                        _ => None,
+                                    };
                                     // Inspect the controller's reply, not just the
                                     // transport result: a `Response::Error`/`Conflict`
                                     // arrives as `Ok(resp)`, so matching on `Ok(_)`
@@ -145,6 +152,16 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                                             // editor; a no-op for every other intent.
                                             app.close_editor();
                                             refresh(&client, &mut app).await;
+                                            // Auto-open the freshly launched session's
+                                            // terminal (the refresh above populated its
+                                            // tmux name).
+                                            if let Some(name) = handoff_task
+                                                .and_then(|t| app.session_for(t))
+                                                .map(|s| s.session_name.clone())
+                                                .filter(|n| !n.is_empty())
+                                            {
+                                                open_terminal_popup(&name, terminal, &mut term, &mut app, &redraw_tx);
+                                            }
                                         }
                                         Ok(Response::Conflict { current }) => {
                                             app.on_description_conflict(current);
@@ -159,15 +176,7 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                                     }
                                 }
                                 Action::OpenTerminal(name) => {
-                                    let size = terminal.size()?;
-                                    let (rows, cols) = popup_pty_size(size.width, size.height);
-                                    match TermSession::attach(&name, rows, cols, redraw_tx.clone()) {
-                                        Ok(t) => {
-                                            term = Some(t);
-                                            app.enter_terminal();
-                                        }
-                                        Err(e) => app.status = Some(e.to_string()),
-                                    }
+                                    open_terminal_popup(&name, terminal, &mut term, &mut app, &redraw_tx);
                                 }
                                 Action::AttachFullscreen(name) => {
                                     fullscreen_attach(terminal, &name);
@@ -208,6 +217,33 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Attach the embedded terminal popup to the named tmux session, sizing the PTY
+/// to the current viewport. Surfaces attach failures to the status line. Shared
+/// by the `t` key (Action::OpenTerminal) and the auto-open after a handoff.
+fn open_terminal_popup(
+    name: &str,
+    terminal: &Term,
+    term: &mut Option<TermSession>,
+    app: &mut App,
+    redraw_tx: &tokio::sync::mpsc::UnboundedSender<()>,
+) {
+    let size = match terminal.size() {
+        Ok(s) => s,
+        Err(e) => {
+            app.status = Some(e.to_string());
+            return;
+        }
+    };
+    let (rows, cols) = popup_pty_size(size.width, size.height);
+    match TermSession::attach(name, rows, cols, redraw_tx.clone()) {
+        Ok(t) => {
+            *term = Some(t);
+            app.enter_terminal();
+        }
+        Err(e) => app.status = Some(e.to_string()),
+    }
 }
 
 /// Refresh the app's snapshot from the controller, surfacing errors to status.

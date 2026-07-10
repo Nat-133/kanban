@@ -204,7 +204,7 @@ mod tests {
         let client = reqwest::Client::new();
         let url = format!("http://{addr}/v1/intent");
         client.post(&url)
-            .json(&Intent::CreateTask { title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() })
+            .json(&Intent::CreateTask { text: "A".into(), column: "todo".parse().unwrap() })
             .send().await.unwrap();
         // the hook would write state then poke; simulate the state write directly
         let id = crate::model::TaskId::new(1);
@@ -229,7 +229,7 @@ mod tests {
         let root = dir.path().join(".kanban");
         crate::controller::store::init_workspace(&root).unwrap();
         crate::controller::apply::apply(&root, Intent::CreateTask {
-            title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+            text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
         let id = crate::model::TaskId::new(1);
         // place it in `doing` as Working first
         crate::controller::events::record_state(&root, id, "user-prompt-submit", "{}").unwrap();
@@ -263,7 +263,7 @@ mod tests {
         let root = dir.path().join(".kanban");
         crate::controller::store::init_workspace(&root).unwrap();
         crate::controller::apply::apply(&root, Intent::CreateTask {
-            title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+            text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
         let id = crate::model::TaskId::new(1);
         crate::controller::events::record_state(&root, id, "notification", "{\"notification_type\":\"idle_prompt\"}").unwrap();
 
@@ -302,7 +302,7 @@ mod tests {
         let client = reqwest::Client::new();
         let url = format!("http://{addr}/v1/intent");
         let create: Response = client.post(&url)
-            .json(&Intent::CreateTask { title: "A".into(), summary: "s".into(), column: "todo".parse().unwrap() })
+            .json(&Intent::CreateTask { text: "A\n\ns".into(), column: "todo".parse().unwrap() })
             .send().await.unwrap().json().await.unwrap();
         assert!(matches!(create, Response::Ok { task: Some(_) }));
 
@@ -327,7 +327,7 @@ mod tests {
         let client = reqwest::Client::new();
         let url = format!("http://{addr}/v1/intent");
         client.post(&url)
-            .json(&Intent::CreateTask { title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() })
+            .json(&Intent::CreateTask { text: "A".into(), column: "todo".parse().unwrap() })
             .send().await.unwrap();
 
         let resp: Response = client.post(&url)
@@ -359,7 +359,7 @@ mod tests {
         }
         let client = reqwest::Client::new();
         client.post(format!("http://{addr}/v1/intent"))
-            .json(&crate::model::proto::Intent::CreateTask { title: "A".into(), summary: "s".into(), column: "todo".parse().unwrap() })
+            .json(&crate::model::proto::Intent::CreateTask { text: "A\n\ns".into(), column: "todo".parse().unwrap() })
             .send().await.unwrap();
 
         let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {

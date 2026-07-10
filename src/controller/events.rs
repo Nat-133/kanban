@@ -281,7 +281,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(),
+        apply(&root, Intent::CreateTask { text: "A".into(),
             column: "todo".parse().unwrap() }).unwrap();
         let id = TaskId::new(1);
 
@@ -313,7 +313,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
         let id = TaskId::new(1);
         record_state(&root, id, "notification", "{\"notification_type\":\"permission_prompt\"}").unwrap();
 
@@ -333,7 +333,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
         let id = TaskId::new(1);
         // claude finished its turn and handed control back -> it needs the human,
         // it is NOT working, so no spinner.
@@ -353,7 +353,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
         let id = TaskId::new(1);
         record_state(&root, id, "session-end", "{}").unwrap();
         ingest_session(&root, id).unwrap();
@@ -368,7 +368,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
         let id = TaskId::new(1);
         record_state(&root, id, "notification", "{\"notification_type\":\"idle_prompt\"}").unwrap();
         assert!(ingest_session(&root, id).unwrap()); // first move reports change
@@ -382,7 +382,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
         let id = TaskId::new(1);
         let mut task = store::load_task(&root, id).unwrap();
         task.status.archived = true;
@@ -401,7 +401,7 @@ mod tests {
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
         crate::controller::apply::apply(&root, crate::model::proto::Intent::CreateTask {
-            title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+            text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
         // a created-but-not-yet-handed-off task has no state file -> Pending -> no move
         assert!(!ingest_session(&root, TaskId::new(1)).unwrap());
     }
@@ -426,7 +426,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
         let id = TaskId::new(1);
         handoff::handoff(&root, id, "claude", &NoLaunch).unwrap(); // writes session.yaml
 
@@ -454,7 +454,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(),
+        apply(&root, Intent::CreateTask { text: "A".into(),
             column: "todo".parse().unwrap() }).unwrap();
         let id = TaskId::new(1);
         handoff::handoff(&root, id, "claude", &NoLaunch).unwrap(); // writes session.yaml
@@ -484,7 +484,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(),
+        apply(&root, Intent::CreateTask { text: "A".into(),
             column: "todo".parse().unwrap() }).unwrap();
         let id = TaskId::new(1);
         handoff::handoff(&root, id, "claude", &NoLaunch).unwrap();
@@ -502,7 +502,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
         let id = TaskId::new(1);
         record_state(&root, id, "session-start", "{}").unwrap();
         assert!(reconcile_all(&root).unwrap());

@@ -113,26 +113,18 @@ pub fn render(f: &mut Frame, app: &App, term_screen: Option<&tui_term::vt100::Sc
 
     match app.mode() {
         Mode::AddTask => {
-            let area = centered_rect(60, 3, f.area());
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title("New task")
-                .border_style(Style::default().fg(Color::Yellow));
-            let para =
-                Paragraph::new(format!("New task: {}", app.input())).block(block);
-            f.render_widget(Clear, area);
-            f.render_widget(para, area);
+            // Combined title/summary box: first line is the title, the body after
+            // a blank line is the summary (git commit-message style).
+            let height = (f.area().height.saturating_mul(40) / 100).max(6);
+            render_editor_overlay(f, app, "New task — title, blank line, then summary".to_string(), 60, height);
         }
         Mode::EditTask => {
-            let area = centered_rect(60, 3, f.area());
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title("Edit task")
-                .border_style(Style::default().fg(Color::Yellow));
-            let para =
-                Paragraph::new(format!("Edit title: {}", app.input())).block(block);
-            f.render_widget(Clear, area);
-            f.render_widget(para, area);
+            let title = app
+                .detail_task()
+                .map(|t| format!("Edit task — {}", t.spec.title))
+                .unwrap_or_else(|| "Edit task".to_string());
+            let height = (f.area().height.saturating_mul(40) / 100).max(6);
+            render_editor_overlay(f, app, title, 60, height);
         }
         Mode::Help => {
             let lines = [
@@ -210,31 +202,13 @@ pub fn render(f: &mut Frame, app: &App, term_screen: Option<&tui_term::vt100::Sc
             }
         }
         Mode::EditDescription => {
-            if let Some(editor) = app.description_editor() {
-                let title = app
-                    .detail_task()
-                    .map(|t| format!("Edit description — {}", t.spec.title))
-                    .unwrap_or_else(|| "Edit description".to_string());
-                // A tall overlay: descriptions are long-form prose.
-                let height = (f.area().height.saturating_mul(60) / 100).max(3);
-                let area = centered_rect(70, height, f.area());
-                let mut block = Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .title_bottom("Ctrl+S save · Esc cancel")
-                    .border_style(Style::default().fg(Color::Yellow));
-                // Surface a conflict / error warning along the bottom border, in red.
-                if let Some(status) = &app.status {
-                    block = block.title_bottom(Span::styled(
-                        format!(" {status} "),
-                        Style::default().fg(Color::Red),
-                    ));
-                }
-                let inner = block.inner(area);
-                f.render_widget(Clear, area);
-                f.render_widget(block, area);
-                f.render_widget(editor, inner);
-            }
+            let title = app
+                .detail_task()
+                .map(|t| format!("Edit description — {}", t.spec.title))
+                .unwrap_or_else(|| "Edit description".to_string());
+            // A tall overlay: descriptions are long-form prose.
+            let height = (f.area().height.saturating_mul(60) / 100).max(3);
+            render_editor_overlay(f, app, title, 70, height);
         }
         Mode::Terminal => {
             if let Some(screen) = term_screen {
@@ -282,6 +256,29 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
     Rect { x, y, width, height }
 }
 
+/// Render a centered modal text-editor overlay (add task, edit task, edit
+/// description) with a yellow border, a save/cancel hint, and any status message
+/// surfaced in red along the bottom border. No-op if no editor is open.
+fn render_editor_overlay(f: &mut Frame, app: &App, title: String, percent_x: u16, height: u16) {
+    let Some(editor) = app.editor() else { return };
+    let area = centered_rect(percent_x, height, f.area());
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_bottom("Ctrl+S save · Esc cancel")
+        .border_style(Style::default().fg(Color::Yellow));
+    if let Some(status) = &app.status {
+        block = block.title_bottom(Span::styled(
+            format!(" {status} "),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    f.render_widget(editor, inner);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,7 +291,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "Buy milk".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { text: "Buy milk".into(), column: "todo".parse().unwrap() }).unwrap();
         crate::tui::client::Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap(), sessions: vec![], descriptions: Default::default() }
     }
 
@@ -305,7 +302,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "Buy milk".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { text: "Buy milk".into(), column: "todo".parse().unwrap() }).unwrap();
         let mut task = store::load_task(&root, TaskId::new(1)).unwrap();
         task.spec.summary = "from the shop".into();
         store::save_task(&root, &task).unwrap();

@@ -455,7 +455,7 @@ mod tests {
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
         crate::controller::apply::apply(&root, crate::model::proto::Intent::CreateTask {
-            title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+            text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
 
         let fake = FakeLauncher::default();
         handoff(&root, TaskId::new(1), "claude", &fake).unwrap();
@@ -476,7 +476,7 @@ mod tests {
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
         crate::controller::apply::apply(&root, crate::model::proto::Intent::CreateTask {
-            title: "A".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+            text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
         let fake = FakeLauncher::default();
         assert!(handoff(&root, TaskId::new(1), "nope", &fake).is_err());
     }

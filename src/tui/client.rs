@@ -59,7 +59,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, crate::controller::server::router(root, tokio::sync::broadcast::channel(64).0)).await.unwrap(); });
 
         let client = Client::new(format!("http://{addr}"));
-        client.send(Intent::CreateTask { title: "A".into(), summary: "s".into(), column: "todo".parse().unwrap() }).await.unwrap();
+        client.send(Intent::CreateTask { text: "A\n\ns".into(), column: "todo".parse().unwrap() }).await.unwrap();
         let snap = client.snapshot().await.unwrap();
         assert_eq!(snap.tasks.len(), 1);
     }

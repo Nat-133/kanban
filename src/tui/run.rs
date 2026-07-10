@@ -143,7 +143,7 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                                         Ok(Response::Ok { .. }) => {
                                             // A committed description edit closes its
                                             // editor; a no-op for every other intent.
-                                            app.close_description_editor();
+                                            app.close_editor();
                                             refresh(&client, &mut app).await;
                                         }
                                         Ok(Response::Conflict { current }) => {

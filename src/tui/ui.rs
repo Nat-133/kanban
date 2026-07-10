@@ -306,13 +306,10 @@ mod tests {
         let mut task = store::load_task(&root, TaskId::new(1)).unwrap();
         task.spec.summary = "from the shop".into();
         store::save_task(&root, &task).unwrap();
-        // GetBoard loads descriptions from disk; build the same map here so the
-        // detail overlay has prose to render.
+        // A description is authored during handoff, not at create time; simulate
+        // a task that already has one so the detail overlay has prose to render.
         let mut descriptions = std::collections::BTreeMap::new();
-        descriptions.insert(
-            TaskId::new(1),
-            store::load_description(&root, TaskId::new(1), &task.spec.description_ref).unwrap().unwrap(),
-        );
+        descriptions.insert(TaskId::new(1), "# Buy milk\n".to_string());
         crate::tui::client::Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap(), sessions: vec![], descriptions }
     }
 
@@ -330,8 +327,8 @@ mod tests {
 
     #[test]
     fn detail_overlay_shows_description() {
-        // create_task seeds description.md with `# <title>`; the detail overlay
-        // must surface it under a Description section.
+        // the detail overlay must surface the description under a Description
+        // section (here the task already has one, as it would post-handoff).
         let mut app = App::new(snap_detail());
         app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE));
         let backend = TestBackend::new(160, 30);

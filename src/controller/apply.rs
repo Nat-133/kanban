@@ -107,13 +107,8 @@ fn create_task(root: &Path, text: String, column: ColumnId) -> anyhow::Result<Re
         status: Default::default(),
     };
     store::save_task(root, &task)?;
-    // Seed the description file so it exists for the worker handoff (which
-    // points at `description.md`) and for anyone editing it externally. Prose
-    // lives in this Markdown file, never inline in task.yaml.
-    store::atomic_write(
-        &store::task_dir(root, id).join(&task.spec.description_ref),
-        &format!("# {}\n", task.spec.title),
-    )?;
+    // NB: no description file is seeded here — the long-form description is
+    // authored during the scoping handoff (see handoff::prepare_session).
     raw.spec.cards.entry(column).or_default().push(id);
     let board = match Board::try_from(raw) {
         Ok(b) => b,
@@ -314,16 +309,16 @@ mod tests {
     }
 
     #[test]
-    fn create_task_seeds_description_file_and_get_board_returns_it() {
+    fn create_task_does_not_seed_description() {
+        // The long-form description is authored during the scoping handoff, not
+        // at creation time — so a fresh task has no description file yet.
         let d = setup(); let r = root(&d);
         apply(&r, Intent::CreateTask { text: "Write docs\n\ns".into(), column: col("todo") }).unwrap();
-        // the description file is seeded on disk with the title heading
         let desc = crate::controller::store::load_description(&r, TaskId::new(1), "description.md").unwrap();
-        assert_eq!(desc.as_deref(), Some("# Write docs\n"));
-        // and the snapshot carries it keyed by task id
+        assert_eq!(desc, None, "no description file until handoff");
         match apply(&r, Intent::GetBoard).unwrap() {
             Response::Snapshot { descriptions, .. } => {
-                assert_eq!(descriptions.get(&TaskId::new(1)).map(String::as_str), Some("# Write docs\n"));
+                assert!(!descriptions.contains_key(&TaskId::new(1)), "snapshot carries no description");
             }
             o => panic!("expected snapshot, got {o:?}"),
         }
@@ -386,10 +381,10 @@ mod tests {
     fn edit_description_writes_when_base_matches() {
         let d = setup(); let r = root(&d);
         apply(&r, Intent::CreateTask { text: "A\n\ns".into(), column: col("todo") }).unwrap();
-        // create seeds "# A\n"; edit from that exact base
+        // a fresh task has no description file, so the matching base is None
         let resp = apply(&r, Intent::EditDescription {
             task: TaskId::new(1),
-            base: Some("# A\n".into()),
+            base: None,
             description: "# A\nnew body\n".into(),
         }).unwrap();
         assert_eq!(resp, Response::Ok { task: Some(TaskId::new(1)) });
@@ -401,15 +396,16 @@ mod tests {
     fn edit_description_conflict_when_base_is_stale() {
         let d = setup(); let r = root(&d);
         apply(&r, Intent::CreateTask { text: "A\n\ns".into(), column: col("todo") }).unwrap();
-        // base does not match what's on disk ("# A\n") -> reject, return current, leave file untouched
+        // on-disk description is absent (None); a non-None base is therefore
+        // stale -> reject with the current (None) content, write nothing
         let resp = apply(&r, Intent::EditDescription {
             task: TaskId::new(1),
             base: Some("something else".into()),
             description: "clobber".into(),
         }).unwrap();
-        assert_eq!(resp, Response::Conflict { current: Some("# A\n".into()) });
+        assert_eq!(resp, Response::Conflict { current: None });
         let desc = store::load_description(&r, TaskId::new(1), "description.md").unwrap();
-        assert_eq!(desc.as_deref(), Some("# A\n"), "conflicting write must not touch the file");
+        assert_eq!(desc, None, "conflicting write must not create the file");
     }
 
     #[test]

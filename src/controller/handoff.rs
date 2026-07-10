@@ -90,6 +90,22 @@ pub fn prepare_session(
         std::os::unix::fs::symlink(&src_abs, &link)?;
     }
 
+    // The long-form description is authored during this session (the scoping
+    // phase), not at task creation. Ensure the canonical file exists — created
+    // empty on first handoff — then symlink it into work/ regardless of
+    // context.include, so the agent can both read and WRITE it: a write through
+    // the link lands in the task dir, which outlives the torn-down sandbox.
+    let desc_canonical = store::task_dir(root, id).join(&task.spec.description_ref);
+    if !desc_canonical.exists() {
+        store::atomic_write(&desc_canonical, "")?;
+    }
+    let desc_canonical = std::fs::canonicalize(&desc_canonical)?;
+    if let Some(name) = Path::new(&task.spec.description_ref).file_name() {
+        let link = work.join(name);
+        let _ = std::fs::remove_file(&link); // idempotent
+        std::os::unix::fs::symlink(&desc_canonical, &link)?;
+    }
+
     // handoff.md (a read material for the agent, so it lives in work/)
     std::fs::write(work.join("handoff.md"), render_handoff(task))?;
 
@@ -212,7 +228,11 @@ fn render_handoff(task: &Task) -> String {
     s.push_str(&format!("# Task handoff: {}\n\n", task.metadata.name));
     s.push_str(&format!("## Title\n\n{}\n\n", task.spec.title));
     s.push_str(&format!("## Summary\n\n{}\n\n", task.spec.summary));
-    s.push_str("## Description\n\nSee `description.md`.\n\n");
+    s.push_str(
+        "## Description\n\nThis task has not been scoped yet. The narrowed scope \
+lives in `description.md` in your working directory — currently empty (or a \
+rough draft). Authoring it is the first phase of this session.\n\n",
+    );
     s.push_str("## Acceptance criteria\n\n");
     for c in &task.spec.acceptance_criteria {
         s.push_str(&format!("- {c}\n"));
@@ -221,7 +241,20 @@ fn render_handoff(task: &Task) -> String {
     for c in &task.spec.context.include {
         s.push_str(&format!("- {c}\n"));
     }
-    s.push_str("\n## Instructions\n\nWork only on this task unless explicitly asked otherwise.\nDo not inspect unrelated task directories.\nUpdate `notes.md` with useful findings.\n");
+    s.push_str(
+        "\n## Instructions\n\n\
+Work in two phases:\n\n\
+1. **Scope.** Investigate the task and narrow it to a concrete, well-bounded \
+piece of work. Write the finalised scope into `description.md`.\n\
+2. **Confirm.** When you believe the description is finalised, STOP and ask me \
+to confirm before you begin implementing. Do not start implementing until I \
+say to go.\n\
+3. **Implement.** Once I confirm, carry out the work described in \
+`description.md`.\n\n\
+Work only on this task unless explicitly asked otherwise.\n\
+Do not inspect unrelated task directories.\n\
+Update `notes.md` with useful findings.\n",
+    );
     s
 }
 
@@ -433,6 +466,50 @@ mod tests {
         assert!(ask.iter().any(|x| x.as_str().unwrap().contains("git push")));
         // hooks must still be present — permissions are ADDITIVE, not a replacement
         assert!(v["hooks"]["Stop"].is_array());
+    }
+
+    #[test]
+    fn prepare_session_creates_description_and_symlinks_it_into_work() {
+        use crate::controller::store;
+        use crate::model::TaskId;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        let id = TaskId::new(1);
+        let task = sample_task(id, "x"); // context.include is empty
+        store::save_task(&root, &task).unwrap();
+        let cfg = store::load_config(&root).unwrap();
+        let ctx = cfg.context_for(None);
+        prepare_session(&root, &task, "claude",
+            cfg.workers.get("claude").unwrap(), &cfg.agents.base_dirs, &ctx).unwrap();
+
+        // The canonical description file is created (empty) in the task dir,
+        // ready for the scoping agent to author.
+        let canonical = store::task_dir(&root, id).join("description.md");
+        assert!(canonical.exists(), "description.md created in the task dir at handoff");
+
+        // It is symlinked into work/ regardless of context.include, so the agent
+        // can read AND write it: a write through the link lands in the canonical
+        // file (which outlives the sandbox).
+        let link = root.join("sessions/task-0001/work/description.md");
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "description.md symlinked into work/",
+        );
+        std::fs::write(&link, "# scoped\n\nnarrowed").unwrap();
+        assert_eq!(std::fs::read_to_string(&canonical).unwrap(), "# scoped\n\nnarrowed");
+    }
+
+    #[test]
+    fn handoff_md_instructs_scope_first_then_asks_before_implementing() {
+        let task = sample_task(crate::model::TaskId::new(1), "x");
+        let md = render_handoff(&task).to_lowercase();
+        assert!(md.contains("description.md"), "must point at the description file");
+        assert!(md.contains("scope"), "must instruct the agent to narrow scope");
+        assert!(
+            md.contains("before") && md.contains("implement"),
+            "must tell the agent to stop and ask before implementing",
+        );
     }
 
     #[derive(Default)]

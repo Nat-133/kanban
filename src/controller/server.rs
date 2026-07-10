@@ -333,11 +333,11 @@ mod tests {
         let resp: Response = client.post(&url)
             .json(&Intent::EditDescription {
                 task: crate::model::TaskId::new(1),
-                base: Some("stale".into()), // create seeded "# A\n", so this is stale
+                base: Some("stale".into()), // fresh task has no description, so this is stale
                 description: "clobber".into(),
             })
             .send().await.unwrap().json().await.unwrap();
-        assert_eq!(resp, Response::Conflict { current: Some("# A\n".into()) });
+        assert_eq!(resp, Response::Conflict { current: None });
     }
 
     #[tokio::test]

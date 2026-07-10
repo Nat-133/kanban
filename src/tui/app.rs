@@ -40,10 +40,10 @@ pub struct App {
     col: usize,
     row: usize,
     mode: Mode,
-    input: String,
     filter: String,
     editing: Option<TaskId>,
-    /// The multi-line description editor, present only in `EditDescription` mode.
+    /// The active multi-line text editor, shared by the add-task, edit-task, and
+    /// edit-description modals (only one is open at a time).
     editor: Option<TextArea<'static>>,
     /// Content the open description editor was seeded from — the optimistic-
     /// concurrency base sent with the edit so the controller can detect a
@@ -61,7 +61,6 @@ impl App {
             col: 0,
             row: 0,
             mode: Mode::Normal,
-            input: String::new(),
             filter: String::new(),
             editing: None,
             editor: None,
@@ -104,8 +103,16 @@ impl App {
         &self.mode
     }
 
-    pub fn input(&self) -> &str {
-        &self.input
+    /// The open modal editor widget, for rendering. `None` unless an add/edit/
+    /// edit-description modal is active.
+    pub fn editor(&self) -> Option<&TextArea<'static>> {
+        self.editor.as_ref()
+    }
+
+    /// The current text of the open modal editor (lines rejoined). `None` when
+    /// no editor is open.
+    pub fn editor_text(&self) -> Option<String> {
+        self.editor.as_ref().map(|e| e.lines().join("\n"))
     }
 
     pub fn selected_col(&self) -> usize {
@@ -148,6 +155,20 @@ impl App {
             .iter()
             .find(|t| t.metadata.name == name)
             .map(|t| t.spec.title.clone())
+    }
+
+    /// The combined `title\n\nsummary` text for a task, used to seed the edit
+    /// box. Mirrors the controller's parse: title, blank line, then summary —
+    /// the blank line and summary are omitted when the summary is empty.
+    fn task_combined_text(&self, id: TaskId) -> Option<String> {
+        let name = id.to_string();
+        self.snapshot.tasks.iter().find(|t| t.metadata.name == name).map(|t| {
+            if t.spec.summary.is_empty() {
+                t.spec.title.clone()
+            } else {
+                format!("{}\n\n{}", t.spec.title, t.spec.summary)
+            }
+        })
     }
 
     /// Cards in a column after applying the case-insensitive title filter.
@@ -254,29 +275,6 @@ impl App {
         self.mode = Mode::EditDescription;
     }
 
-    /// The current text of the open description editor (lines rejoined). `None`
-    /// when no editor is open.
-    pub fn description_editor_text(&self) -> Option<String> {
-        self.editor.as_ref().map(|e| e.lines().join("\n"))
-    }
-
-    /// The open description editor widget, for rendering. `None` unless in
-    /// `EditDescription` mode.
-    pub fn description_editor(&self) -> Option<&TextArea<'static>> {
-        self.editor.as_ref()
-    }
-
-    /// Close the description editor and return to the board. Called by the run
-    /// loop once the controller confirms the write (`Response::Ok`).
-    pub fn close_description_editor(&mut self) {
-        if matches!(self.mode, Mode::EditDescription) {
-            self.mode = Mode::Normal;
-        }
-        self.editor = None;
-        self.editing = None;
-        self.desc_base = None;
-    }
-
     /// Handle a rejected description write: the file changed under us. Keep the
     /// user's buffer, rebase the concurrency base onto the now-current content so
     /// a second `Ctrl+S` overwrites it deliberately, and warn.
@@ -291,7 +289,7 @@ impl App {
         // write's fate, so a conflict can restore the buffer.
         if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
             let Some(task) = self.editing else { return Action::None };
-            let description = self.description_editor_text().unwrap_or_default();
+            let description = self.editor_text().unwrap_or_default();
             return Action::Send(Intent::EditDescription {
                 task,
                 base: self.desc_base.clone(),
@@ -300,7 +298,7 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => {
-                self.close_description_editor();
+                self.close_editor();
                 Action::None
             }
             _ => {
@@ -369,15 +367,17 @@ impl App {
                 Action::None
             }
             KeyCode::Char('a') => {
+                self.editor = Some(TextArea::default());
+                self.editing = None;
                 self.mode = Mode::AddTask;
-                self.input.clear();
                 Action::None
             }
             KeyCode::Char('e') => {
                 if let Some(t) = self.selected_task() {
-                    self.mode = Mode::EditTask;
+                    let seed = self.task_combined_text(t).unwrap_or_default();
+                    self.editor = Some(TextArea::new(seed.split('\n').map(str::to_string).collect()));
                     self.editing = Some(t);
-                    self.input = self.task_title(t).unwrap_or_default();
+                    self.mode = Mode::EditTask;
                 }
                 Action::None
             }
@@ -430,72 +430,71 @@ impl App {
         }
     }
 
+    /// True when the key is Ctrl+S, the commit chord for the multi-line modals
+    /// (Enter inserts a newline there, so it can't double as submit).
+    fn is_save(key: &KeyEvent) -> bool {
+        key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL)
+    }
+
     fn on_add(&mut self, key: KeyEvent) -> Action {
+        if Self::is_save(&key) {
+            let text = self.editor_text().unwrap_or_default();
+            let column = self.columns()[self.col].id.clone();
+            self.close_editor();
+            if text.trim().is_empty() {
+                return Action::None;
+            }
+            return Action::Send(Intent::CreateTask { text, column });
+        }
         match key.code {
             KeyCode::Esc => {
-                self.mode = Mode::Normal;
-                self.input.clear();
+                self.close_editor();
                 Action::None
             }
-            KeyCode::Enter => {
-                let title = std::mem::take(&mut self.input);
-                self.mode = Mode::Normal;
-                if title.is_empty() {
-                    return Action::None;
+            _ => {
+                if let Some(e) = self.editor.as_mut() {
+                    e.input(key);
                 }
-                let column = self.columns()[self.col].id.clone();
-                Action::Send(Intent::CreateTask {
-                    title,
-                    summary: String::new(),
-                    column,
-                })
-            }
-            KeyCode::Backspace => {
-                self.input.pop();
                 Action::None
             }
-            KeyCode::Char(c) => {
-                self.input.push(c);
-                Action::None
-            }
-            _ => Action::None,
         }
     }
 
     fn on_edit(&mut self, key: KeyEvent) -> Action {
+        if Self::is_save(&key) {
+            let text = self.editor_text().unwrap_or_default();
+            let task = self.editing;
+            self.close_editor();
+            if text.trim().is_empty() {
+                return Action::None;
+            }
+            return match task {
+                Some(task) => Action::Send(Intent::EditTask { task, text }),
+                None => Action::None,
+            };
+        }
         match key.code {
             KeyCode::Esc => {
-                self.mode = Mode::Normal;
-                self.editing = None;
-                self.input.clear();
+                self.close_editor();
                 Action::None
             }
-            KeyCode::Enter => {
-                let title = std::mem::take(&mut self.input);
-                let task = self.editing.take();
-                self.mode = Mode::Normal;
-                if title.is_empty() {
-                    return Action::None;
+            _ => {
+                if let Some(e) = self.editor.as_mut() {
+                    e.input(key);
                 }
-                match task {
-                    Some(task) => Action::Send(Intent::EditTask {
-                        task,
-                        title: Some(title),
-                        summary: None,
-                    }),
-                    None => Action::None,
-                }
-            }
-            KeyCode::Backspace => {
-                self.input.pop();
                 Action::None
             }
-            KeyCode::Char(c) => {
-                self.input.push(c);
-                Action::None
-            }
-            _ => Action::None,
         }
+    }
+
+    /// Tear down whichever modal editor is open and return to the board. Called
+    /// by the run loop once the controller confirms a description write
+    /// (`Response::Ok`); a no-op for the add/edit modals, which close themselves.
+    pub fn close_editor(&mut self) {
+        self.mode = Mode::Normal;
+        self.editor = None;
+        self.editing = None;
+        self.desc_base = None;
     }
 
     fn on_search(&mut self, key: KeyEvent) -> Action {
@@ -542,8 +541,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "First".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
-        apply(&root, Intent::CreateTask { title: "Second".into(), summary: "".into(), column: "todo".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { text: "First".into(), column: "todo".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { text: "Second".into(), column: "todo".parse().unwrap() }).unwrap();
         Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap(), sessions: vec![], descriptions: Default::default() }
     }
 
@@ -633,19 +632,31 @@ mod tests {
     }
 
     #[test]
-    fn add_task_flow_emits_create_intent() {
+    fn add_task_flow_emits_create_intent_with_combined_text() {
         let mut app = App::new(snap());
         app.on_key(key('a'));
         assert!(matches!(app.mode(), Mode::AddTask));
-        app.on_key(key('H')); app.on_key(key('i')); // type "Hi"
-        let action = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // type a title line, a blank line, then a summary line
+        app.on_key(key('H')); app.on_key(key('i'));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // newline in the box, not submit
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(key('m')); app.on_key(key('e'));
+        let action = app.on_key(ctrl('s')); // Ctrl+S submits
         match action {
-            Action::Send(Intent::CreateTask { title, column, .. }) => {
-                assert_eq!(title, "Hi");
+            Action::Send(Intent::CreateTask { text, column }) => {
+                assert_eq!(text, "Hi\n\nme");
                 assert_eq!(column.as_str(), "todo");
             }
             o => panic!("expected CreateTask, got {o:?}"),
         }
+        assert!(matches!(app.mode(), Mode::Normal));
+    }
+
+    #[test]
+    fn add_task_empty_box_is_cancelled() {
+        let mut app = App::new(snap());
+        app.on_key(key('a'));
+        assert_eq!(app.on_key(ctrl('s')), Action::None, "empty box sends nothing");
         assert!(matches!(app.mode(), Mode::Normal));
     }
 
@@ -701,16 +712,28 @@ mod tests {
     }
 
     #[test]
-    fn e_edits_selected_task_title() {
-        let mut app = App::new(snap()); // task-0001 title "First" selected
+    fn e_opens_edit_task_seeded_with_current_and_submits() {
+        let mut app = App::new(snap()); // task-0001 title "First", no summary
         app.on_key(key('e'));
         assert!(matches!(app.mode(), Mode::EditTask));
-        // modal pre-filled with current title -> backspace it out, type "New"
-        for _ in 0.."First".len() { app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)); }
-        app.on_key(key('N')); app.on_key(key('e')); app.on_key(key('w'));
-        let action = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(action, Action::Send(Intent::EditTask { task: TaskId::new(1), title: Some("New".into()), summary: None }));
+        assert_eq!(app.editor_text().as_deref(), Some("First"), "seeded with current title");
+        // Ctrl+S submits the box verbatim as the combined text.
+        let action = app.on_key(ctrl('s'));
+        assert_eq!(action, Action::Send(Intent::EditTask { task: TaskId::new(1), text: "First".into() }));
         assert!(matches!(app.mode(), Mode::Normal));
+    }
+
+    #[test]
+    fn e_seeds_edit_box_with_title_blank_line_and_summary() {
+        use crate::controller::{store, apply::apply};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        apply(&root, Intent::CreateTask { text: "Title\n\nSome summary".into(), column: "todo".parse().unwrap() }).unwrap();
+        let s = Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap(), sessions: vec![], descriptions: Default::default() };
+        let mut app = App::new(s);
+        app.on_key(key('e'));
+        assert_eq!(app.editor_text().as_deref(), Some("Title\n\nSome summary"));
     }
 
     fn ctrl(c: char) -> KeyEvent { KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL) }
@@ -729,7 +752,7 @@ mod tests {
         assert!(matches!(app.mode(), Mode::Detail));
         app.on_key(key('e')); // -> edit description
         assert!(matches!(app.mode(), Mode::EditDescription));
-        assert_eq!(app.description_editor_text().as_deref(), Some("# A\nline two\n"));
+        assert_eq!(app.editor_text().as_deref(), Some("# A\nline two\n"));
     }
 
     #[test]
@@ -759,18 +782,18 @@ mod tests {
         let action = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(action, Action::None);
         assert!(matches!(app.mode(), Mode::Normal));
-        assert!(app.description_editor_text().is_none());
+        assert!(app.editor_text().is_none());
     }
 
     #[test]
-    fn close_description_editor_returns_to_board() {
+    fn close_editor_returns_to_board() {
         let mut app = App::new(snap_with_desc("# A\n"));
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         app.on_key(key('e'));
         app.on_key(ctrl('s')); // save keeps it open
-        app.close_description_editor(); // run loop calls this on Response::Ok
+        app.close_editor(); // run loop calls this on Response::Ok
         assert!(matches!(app.mode(), Mode::Normal));
-        assert!(app.description_editor_text().is_none());
+        assert!(app.editor_text().is_none());
     }
 
     #[test]
@@ -787,7 +810,7 @@ mod tests {
         app.on_description_conflict(Some("# A\nother worker\n".into()));
         // still editing, buffer preserved, base rebased so a re-save wins, warning shown
         assert!(matches!(app.mode(), Mode::EditDescription));
-        assert_eq!(app.description_editor_text().as_deref(), Some(saved.as_str()));
+        assert_eq!(app.editor_text().as_deref(), Some(saved.as_str()));
         assert!(app.status.as_deref().unwrap_or("").to_lowercase().contains("disk"));
         let action = app.on_key(ctrl('s'));
         match action {

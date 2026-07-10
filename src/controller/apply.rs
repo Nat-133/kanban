@@ -46,8 +46,8 @@ pub fn apply(root: &Path, intent: Intent) -> anyhow::Result<Response> {
             }
             Ok(Response::Snapshot { board, tasks, sessions, descriptions })
         }
-        Intent::CreateTask { title, summary, column } => create_task(root, title, summary, column),
-        Intent::EditTask { task, title, summary } => edit_task(root, task, title, summary),
+        Intent::CreateTask { text, column } => create_task(root, text, column),
+        Intent::EditTask { task, text } => edit_task(root, task, text),
         Intent::EditDescription { task, base, description } => edit_description(root, task, base, description),
         Intent::MoveCard { task, to_column, position } => move_card(root, task, to_column, position),
         Intent::ReorderCard { task, position } => reorder_card(root, task, position),
@@ -62,6 +62,18 @@ pub fn apply(root: &Path, intent: Intent) -> anyhow::Result<Response> {
     }
 }
 
+/// Split a combined task-text box into `(title, summary)` using the git
+/// commit-message convention: the first line is the title, everything after the
+/// first blank line is the summary. Lenient: the title is trimmed, and the
+/// summary is whatever follows the first newline, trimmed (so the blank
+/// separator line is consumed while internal body blank lines survive).
+fn parse_title_summary(text: &str) -> (String, String) {
+    match text.split_once('\n') {
+        Some((title, rest)) => (title.trim().to_string(), rest.trim().to_string()),
+        None => (text.trim().to_string(), String::new()),
+    }
+}
+
 /// Remove `id` from every column's card list, keeping the board duplicate-free.
 fn remove_card(raw: &mut RawBoard, id: TaskId) {
     for v in raw.spec.cards.values_mut() {
@@ -69,11 +81,12 @@ fn remove_card(raw: &mut RawBoard, id: TaskId) {
     }
 }
 
-fn create_task(root: &Path, title: String, summary: String, column: ColumnId) -> anyhow::Result<Response> {
+fn create_task(root: &Path, text: String, column: ColumnId) -> anyhow::Result<Response> {
     let mut raw: RawBoard = store::load_board_checked(root)?.into();
     if !raw.spec.columns.iter().any(|c| c.id == column) {
         return Ok(Response::Error { message: format!("unknown column: {column}") });
     }
+    let (title, summary) = parse_title_summary(&text);
     let id = store::next_task_id(root)?;
     let task = Task {
         api_version: ApiVersion::V1Alpha1,
@@ -110,17 +123,14 @@ fn create_task(root: &Path, title: String, summary: String, column: ColumnId) ->
     Ok(Response::Ok { task: Some(id) })
 }
 
-fn edit_task(root: &Path, task_id: TaskId, title: Option<String>, summary: Option<String>) -> anyhow::Result<Response> {
+fn edit_task(root: &Path, task_id: TaskId, text: String) -> anyhow::Result<Response> {
     if !store::task_dir(root, task_id).exists() {
         return Ok(Response::Error { message: format!("task not found: {task_id}") });
     }
+    let (title, summary) = parse_title_summary(&text);
     let mut task = store::load_task(root, task_id)?;
-    if let Some(title) = title {
-        task.spec.title = title;
-    }
-    if let Some(summary) = summary {
-        task.spec.summary = summary;
-    }
+    task.spec.title = title;
+    task.spec.summary = summary;
     store::save_task(root, &task)?;
     Ok(Response::Ok { task: Some(task_id) })
 }
@@ -263,9 +273,33 @@ mod tests {
     fn col(s: &str) -> crate::model::ColumnId { s.parse().unwrap() }
 
     #[test]
+    fn parse_title_summary_splits_on_first_blank_line() {
+        // Commit-message convention: subject, blank line, body.
+        assert_eq!(
+            parse_title_summary("Fix the bug\n\nIt was caused by X.\nAlso Y."),
+            ("Fix the bug".to_string(), "It was caused by X.\nAlso Y.".to_string()),
+        );
+    }
+
+    #[test]
+    fn parse_title_summary_single_line_has_empty_summary() {
+        assert_eq!(parse_title_summary("Just a title"), ("Just a title".to_string(), String::new()));
+    }
+
+    #[test]
+    fn parse_title_summary_trims_title_and_surrounding_blank_lines() {
+        // Leading/trailing whitespace on the title goes; the blank line between
+        // subject and body is consumed; internal body blank lines are preserved.
+        assert_eq!(
+            parse_title_summary("  Title  \n\n\npara one\n\npara two\n"),
+            ("Title".to_string(), "para one\n\npara two".to_string()),
+        );
+    }
+
+    #[test]
     fn create_task_allocates_id_and_places_on_board() {
         let d = setup(); let r = root(&d);
-        let resp = apply(&r, Intent::CreateTask { title: "First".into(), summary: "s".into(), column: col("todo") }).unwrap();
+        let resp = apply(&r, Intent::CreateTask { text: "First\n\ns".into(), column: col("todo") }).unwrap();
         assert_eq!(resp, Response::Ok { task: Some(TaskId::new(1)) });
         let board = crate::controller::store::load_board(&r).unwrap();
         assert_eq!(board.cards().get(&col("todo")).unwrap(), &vec![TaskId::new(1)]);
@@ -275,14 +309,14 @@ mod tests {
     #[test]
     fn create_task_in_unknown_column_errors() {
         let d = setup(); let r = root(&d);
-        let resp = apply(&r, Intent::CreateTask { title: "x".into(), summary: "s".into(), column: col("ghost") }).unwrap();
+        let resp = apply(&r, Intent::CreateTask { text: "x".into(), column: col("ghost") }).unwrap();
         assert!(matches!(resp, Response::Error { .. }));
     }
 
     #[test]
     fn create_task_seeds_description_file_and_get_board_returns_it() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "Write docs".into(), summary: "s".into(), column: col("todo") }).unwrap();
+        apply(&r, Intent::CreateTask { text: "Write docs\n\ns".into(), column: col("todo") }).unwrap();
         // the description file is seeded on disk with the title heading
         let desc = crate::controller::store::load_description(&r, TaskId::new(1), "description.md").unwrap();
         assert_eq!(desc.as_deref(), Some("# Write docs\n"));
@@ -298,7 +332,7 @@ mod tests {
     #[test]
     fn get_board_returns_snapshot_with_tasks() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
+        apply(&r, Intent::CreateTask { text: "A\n\ns".into(), column: col("todo") }).unwrap();
         match apply(&r, Intent::GetBoard).unwrap() {
             Response::Snapshot { tasks, .. } => assert_eq!(tasks.len(), 1),
             o => panic!("expected snapshot, got {o:?}"),
@@ -314,7 +348,7 @@ mod tests {
     #[test]
     fn get_board_includes_sessions_with_phase() {
         let dir = setup(); let r = root(&dir);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
+        apply(&r, Intent::CreateTask { text: "A\n\ns".into(), column: col("todo") }).unwrap();
         crate::controller::handoff::handoff(&r, TaskId::new(1), "claude", &NoLaunch).unwrap();
         crate::controller::events::record_state(&r, TaskId::new(1), "notification", "{\"notification_type\":\"permission_prompt\"}").unwrap();
         crate::controller::events::ingest_session(&r, TaskId::new(1)).unwrap();
@@ -330,19 +364,28 @@ mod tests {
     }
 
     #[test]
-    fn edit_task_updates_fields() {
+    fn create_task_splits_combined_text_into_title_and_summary() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
-        apply(&r, Intent::EditTask { task: TaskId::new(1), title: Some("B".into()), summary: None }).unwrap();
+        apply(&r, Intent::CreateTask { text: "Buy milk\n\nsemi-skimmed, 2 pints".into(), column: col("todo") }).unwrap();
+        let t = crate::controller::store::load_task(&r, TaskId::new(1)).unwrap();
+        assert_eq!(t.spec.title, "Buy milk");
+        assert_eq!(t.spec.summary, "semi-skimmed, 2 pints");
+    }
+
+    #[test]
+    fn edit_task_replaces_both_fields_from_combined_text() {
+        let d = setup(); let r = root(&d);
+        apply(&r, Intent::CreateTask { text: "A\n\nold summary".into(), column: col("todo") }).unwrap();
+        apply(&r, Intent::EditTask { task: TaskId::new(1), text: "B\n\nnew summary".into() }).unwrap();
         let t = crate::controller::store::load_task(&r, TaskId::new(1)).unwrap();
         assert_eq!(t.spec.title, "B");
-        assert_eq!(t.spec.summary, "s"); // unchanged
+        assert_eq!(t.spec.summary, "new summary");
     }
 
     #[test]
     fn edit_description_writes_when_base_matches() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
+        apply(&r, Intent::CreateTask { text: "A\n\ns".into(), column: col("todo") }).unwrap();
         // create seeds "# A\n"; edit from that exact base
         let resp = apply(&r, Intent::EditDescription {
             task: TaskId::new(1),
@@ -357,7 +400,7 @@ mod tests {
     #[test]
     fn edit_description_conflict_when_base_is_stale() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
+        apply(&r, Intent::CreateTask { text: "A\n\ns".into(), column: col("todo") }).unwrap();
         // base does not match what's on disk ("# A\n") -> reject, return current, leave file untouched
         let resp = apply(&r, Intent::EditDescription {
             task: TaskId::new(1),
@@ -383,14 +426,14 @@ mod tests {
     #[test]
     fn edit_missing_task_errors() {
         let d = setup(); let r = root(&d);
-        let resp = apply(&r, Intent::EditTask { task: TaskId::new(99), title: Some("B".into()), summary: None }).unwrap();
+        let resp = apply(&r, Intent::EditTask { task: TaskId::new(99), text: "B".into() }).unwrap();
         assert!(matches!(resp, Response::Error { .. }));
     }
 
     #[test]
     fn move_card_moves_between_columns() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
+        apply(&r, Intent::CreateTask { text: "A\n\ns".into(), column: col("todo") }).unwrap();
         apply(&r, Intent::MoveCard { task: TaskId::new(1), to_column: col("doing"), position: None }).unwrap();
         let board = crate::controller::store::load_board(&r).unwrap();
         assert!(board.cards().get(&col("todo")).unwrap().is_empty());
@@ -400,7 +443,7 @@ mod tests {
     #[test]
     fn move_card_to_unknown_column_errors() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
+        apply(&r, Intent::CreateTask { text: "A\n\ns".into(), column: col("todo") }).unwrap();
         let resp = apply(&r, Intent::MoveCard { task: TaskId::new(1), to_column: col("ghost"), position: None }).unwrap();
         assert!(matches!(resp, Response::Error { .. }));
     }
@@ -408,8 +451,8 @@ mod tests {
     #[test]
     fn reorder_card_within_column() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
-        apply(&r, Intent::CreateTask { title: "B".into(), summary: "s".into(), column: col("todo") }).unwrap();
+        apply(&r, Intent::CreateTask { text: "A\n\ns".into(), column: col("todo") }).unwrap();
+        apply(&r, Intent::CreateTask { text: "B\n\ns".into(), column: col("todo") }).unwrap();
         // inbox = [task-0001, task-0002]; move task-0002 to position 0
         apply(&r, Intent::ReorderCard { task: TaskId::new(2), position: 0 }).unwrap();
         let board = crate::controller::store::load_board(&r).unwrap();
@@ -428,7 +471,7 @@ mod tests {
     #[test]
     fn archive_flags_task_kills_session_and_archives_session_dir() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "".into(), column: col("todo") }).unwrap();
+        apply(&r, Intent::CreateTask { text: "A".into(), column: col("todo") }).unwrap();
         let id = TaskId::new(1);
         // hand off (fake launcher) so a session.yaml + sessions/ dir exist
         handoff::handoff(&r, id, "claude", &FakeLauncher::default()).unwrap();
@@ -450,7 +493,7 @@ mod tests {
     #[test]
     fn archived_task_is_hidden_from_snapshot() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "s".into(), column: col("todo") }).unwrap();
+        apply(&r, Intent::CreateTask { text: "A\n\ns".into(), column: col("todo") }).unwrap();
         apply(&r, Intent::ArchiveTask { task: TaskId::new(1) }).unwrap();
         // still on disk…
         assert!(store::load_task(&r, TaskId::new(1)).unwrap().status.archived);
@@ -471,7 +514,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { title: "A".into(), summary: "".into(),
+        apply(&root, Intent::CreateTask { text: "A".into(),
             column: "todo".parse().unwrap() }).unwrap();
         let id = TaskId::new(1);
 
@@ -489,7 +532,7 @@ mod tests {
     #[test]
     fn archive_is_idempotent() {
         let d = setup(); let r = root(&d);
-        apply(&r, Intent::CreateTask { title: "A".into(), summary: "".into(), column: col("todo") }).unwrap();
+        apply(&r, Intent::CreateTask { text: "A".into(), column: col("todo") }).unwrap();
         let id = TaskId::new(1);
         let fake = FakeLauncher::default();
         archive(&r, id, &fake).unwrap();

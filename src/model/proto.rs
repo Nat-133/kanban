@@ -11,8 +11,12 @@ use std::collections::BTreeMap;
 pub enum Intent {
     InitWorkspace,
     GetBoard,
-    CreateTask { title: String, summary: String, column: ColumnId },
-    EditTask { task: TaskId, title: Option<String>, summary: Option<String> },
+    /// Create a task from one combined text box (git commit-message style: first
+    /// line is the title, the body after the first blank line is the summary).
+    /// The controller splits it; storage keeps title and summary as two fields.
+    CreateTask { text: String, column: ColumnId },
+    /// Replace a task's title and summary from the same combined text box.
+    EditTask { task: TaskId, text: String },
     /// Replace a task's long-form `description.md`. `base` is the content the
     /// editor was seeded from (`None` if the task had no description file); the
     /// controller rejects the write with `Response::Conflict` when the on-disk
@@ -74,7 +78,7 @@ mod tests {
 
     #[test]
     fn create_task_intent_round_trips_json() {
-        let intent = Intent::CreateTask { title: "Build X".into(), summary: "do X".into(), column: "todo".parse().unwrap() };
+        let intent = Intent::CreateTask { text: "Build X\n\ndo X".into(), column: "todo".parse().unwrap() };
         let j = serde_json::to_string(&intent).unwrap();
         let back: Intent = serde_json::from_str(&j).unwrap();
         assert_eq!(intent, back);

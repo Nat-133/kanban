@@ -265,7 +265,7 @@ fn render_editor_overlay(f: &mut Frame, app: &App, title: String, percent_x: u16
     let mut block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .title_bottom("Ctrl+S save · Esc cancel")
+        .title_bottom("Enter save · Shift+Enter newline · Esc cancel")
         .border_style(Style::default().fg(Color::Yellow));
     if let Some(status) = &app.status {
         block = block.title_bottom(Span::styled(
@@ -353,7 +353,7 @@ mod tests {
         terminal.draw(|f| render(f, &app, None)).unwrap();
         let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("body text"), "editor should show the seeded description");
-        assert!(text.contains("Ctrl+S"), "overlay should hint how to save");
+        assert!(text.contains("Enter save"), "overlay should hint how to save");
     }
 
     #[test]

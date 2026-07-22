@@ -4,7 +4,7 @@ use crate::model::proto::Intent;
 use crate::model::{Column, ColumnId, Task, TaskId};
 use crate::tui::client::Snapshot;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{CursorMove, TextArea};
 
 /// The result of handling a key: nothing, quit the loop, or send an intent.
 #[derive(Debug, Clone, PartialEq)]
@@ -269,7 +269,11 @@ impl App {
             Some(s) => s.split('\n').map(str::to_string).collect(),
             None => vec![String::new()],
         };
-        self.editor = Some(TextArea::new(lines));
+        let mut editor = TextArea::new(lines);
+        // Start editing where the text ends, not at the top.
+        editor.move_cursor(CursorMove::Bottom);
+        editor.move_cursor(CursorMove::End);
+        self.editor = Some(editor);
         self.desc_base = base;
         self.editing = Some(task);
         self.mode = Mode::EditDescription;
@@ -277,17 +281,17 @@ impl App {
 
     /// Handle a rejected description write: the file changed under us. Keep the
     /// user's buffer, rebase the concurrency base onto the now-current content so
-    /// a second `Ctrl+S` overwrites it deliberately, and warn.
+    /// a second `Enter` overwrites it deliberately, and warn.
     pub fn on_description_conflict(&mut self, current: Option<String>) {
         self.desc_base = current;
         self.status =
-            Some("description changed on disk — Ctrl+S again to overwrite, Esc to discard".into());
+            Some("description changed on disk — Enter again to overwrite, Esc to discard".into());
     }
 
     fn on_edit_description(&mut self, key: KeyEvent) -> Action {
-        // Ctrl+S commits; the editor stays open until the run loop learns the
+        // Enter commits; the editor stays open until the run loop learns the
         // write's fate, so a conflict can restore the buffer.
-        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if Self::is_submit(&key) {
             let Some(task) = self.editing else { return Action::None };
             let description = self.editor_text().unwrap_or_default();
             return Action::Send(Intent::EditDescription {
@@ -303,7 +307,7 @@ impl App {
             }
             _ => {
                 if let Some(e) = self.editor.as_mut() {
-                    e.input(key);
+                    Self::feed(e, key);
                 }
                 Action::None
             }
@@ -375,7 +379,11 @@ impl App {
             KeyCode::Char('e') => {
                 if let Some(t) = self.selected_task() {
                     let seed = self.task_combined_text(t).unwrap_or_default();
-                    self.editor = Some(TextArea::new(seed.split('\n').map(str::to_string).collect()));
+                    let mut editor = TextArea::new(seed.split('\n').map(str::to_string).collect());
+                    // Start editing where the text ends, not at the top.
+                    editor.move_cursor(CursorMove::Bottom);
+                    editor.move_cursor(CursorMove::End);
+                    self.editor = Some(editor);
                     self.editing = Some(t);
                     self.mode = Mode::EditTask;
                 }
@@ -430,14 +438,31 @@ impl App {
         }
     }
 
-    /// True when the key is Ctrl+S, the commit chord for the multi-line modals
-    /// (Enter inserts a newline there, so it can't double as submit).
-    fn is_save(key: &KeyEvent) -> bool {
-        key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL)
+    /// The commit chord for the multi-line modals: a bare Enter. Shift+Enter
+    /// (and Ctrl+J, as a fallback) insert a newline instead — see `feed`. The
+    /// run loop enables `modifyOtherKeys` so the terminal reports Shift+Enter
+    /// distinctly from plain Enter even through tmux.
+    fn is_submit(key: &KeyEvent) -> bool {
+        key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT)
+    }
+
+    /// Route a key into an open modal editor, translating the newline chords —
+    /// Shift+Enter and Ctrl+J — into an actual line break, since a bare Enter
+    /// now submits.
+    fn feed(editor: &mut TextArea<'static>, key: KeyEvent) {
+        let shift_enter =
+            key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT);
+        let ctrl_j =
+            key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL);
+        if shift_enter || ctrl_j {
+            editor.insert_newline();
+        } else {
+            editor.input(key);
+        }
     }
 
     fn on_add(&mut self, key: KeyEvent) -> Action {
-        if Self::is_save(&key) {
+        if Self::is_submit(&key) {
             let text = self.editor_text().unwrap_or_default();
             let column = self.columns()[self.col].id.clone();
             self.close_editor();
@@ -453,7 +478,7 @@ impl App {
             }
             _ => {
                 if let Some(e) = self.editor.as_mut() {
-                    e.input(key);
+                    Self::feed(e, key);
                 }
                 Action::None
             }
@@ -461,7 +486,7 @@ impl App {
     }
 
     fn on_edit(&mut self, key: KeyEvent) -> Action {
-        if Self::is_save(&key) {
+        if Self::is_submit(&key) {
             let text = self.editor_text().unwrap_or_default();
             let task = self.editing;
             self.close_editor();
@@ -480,7 +505,7 @@ impl App {
             }
             _ => {
                 if let Some(e) = self.editor.as_mut() {
-                    e.input(key);
+                    Self::feed(e, key);
                 }
                 Action::None
             }
@@ -638,10 +663,10 @@ mod tests {
         assert!(matches!(app.mode(), Mode::AddTask));
         // type a title line, a blank line, then a summary line
         app.on_key(key('H')); app.on_key(key('i'));
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // newline in the box, not submit
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(ctrl('j')); // Ctrl+J inserts a newline in the box, not submit
+        app.on_key(ctrl('j'));
         app.on_key(key('m')); app.on_key(key('e'));
-        let action = app.on_key(ctrl('s')); // Ctrl+S submits
+        let action = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // Enter submits
         match action {
             Action::Send(Intent::CreateTask { text, column }) => {
                 assert_eq!(text, "Hi\n\nme");
@@ -653,10 +678,26 @@ mod tests {
     }
 
     #[test]
+    fn shift_enter_inserts_newline_without_submitting() {
+        let mut app = App::new(snap());
+        app.on_key(key('a'));
+        app.on_key(key('H')); app.on_key(key('i'));
+        // Shift+Enter is a newline, not a submit — the box stays open.
+        let action = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(action, Action::None);
+        assert!(matches!(app.mode(), Mode::AddTask), "still editing after Shift+Enter");
+        app.on_key(key('y'));
+        assert_eq!(app.editor_text().as_deref(), Some("Hi\ny"));
+        // A bare Enter then submits the whole box.
+        let action = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(action, Action::Send(Intent::CreateTask { .. })));
+    }
+
+    #[test]
     fn add_task_empty_box_is_cancelled() {
         let mut app = App::new(snap());
         app.on_key(key('a'));
-        assert_eq!(app.on_key(ctrl('s')), Action::None, "empty box sends nothing");
+        assert_eq!(app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Action::None, "empty box sends nothing");
         assert!(matches!(app.mode(), Mode::Normal));
     }
 
@@ -717,8 +758,8 @@ mod tests {
         app.on_key(key('e'));
         assert!(matches!(app.mode(), Mode::EditTask));
         assert_eq!(app.editor_text().as_deref(), Some("First"), "seeded with current title");
-        // Ctrl+S submits the box verbatim as the combined text.
-        let action = app.on_key(ctrl('s'));
+        // Enter submits the box verbatim as the combined text.
+        let action = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(action, Action::Send(Intent::EditTask { task: TaskId::new(1), text: "First".into() }));
         assert!(matches!(app.mode(), Mode::Normal));
     }
@@ -756,12 +797,12 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_s_emits_edit_description_and_keeps_editor_open() {
+    fn enter_emits_edit_description_and_keeps_editor_open() {
         let mut app = App::new(snap_with_desc("# A\n"));
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // -> Detail
         app.on_key(key('e'));
         app.on_key(key('X')); // type into the buffer
-        let action = app.on_key(ctrl('s'));
+        let action = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match action {
             Action::Send(Intent::EditDescription { task, base, description }) => {
                 assert_eq!(task, TaskId::new(1));
@@ -790,7 +831,7 @@ mod tests {
         let mut app = App::new(snap_with_desc("# A\n"));
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         app.on_key(key('e'));
-        app.on_key(ctrl('s')); // save keeps it open
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)); // save keeps it open
         app.close_editor(); // run loop calls this on Response::Ok
         assert!(matches!(app.mode(), Mode::Normal));
         assert!(app.editor_text().is_none());
@@ -802,7 +843,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         app.on_key(key('e'));
         app.on_key(key('X'));
-        let saved = match app.on_key(ctrl('s')) {
+        let saved = match app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
             Action::Send(Intent::EditDescription { description, .. }) => description,
             o => panic!("expected EditDescription, got {o:?}"),
         };
@@ -812,7 +853,7 @@ mod tests {
         assert!(matches!(app.mode(), Mode::EditDescription));
         assert_eq!(app.editor_text().as_deref(), Some(saved.as_str()));
         assert!(app.status.as_deref().unwrap_or("").to_lowercase().contains("disk"));
-        let action = app.on_key(ctrl('s'));
+        let action = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         match action {
             Action::Send(Intent::EditDescription { base, .. }) =>
                 assert_eq!(base, Some("# A\nother worker\n".into()), "re-save must be based on the new on-disk content"),

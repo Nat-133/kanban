@@ -13,8 +13,17 @@ use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
-use std::io::Stdout;
+use std::io::{Stdout, Write};
 use std::time::Duration;
+
+/// Enable xterm `modifyOtherKeys` level 2. This makes the terminal report
+/// modified keys — crucially Shift+Enter — as distinct `CSI u` sequences
+/// (e.g. `ESC [ 13 ; 2 u`) instead of a bare `\r` indistinguishable from
+/// plain Enter. Unlike the kitty keyboard protocol, tmux relays these, and
+/// crossterm decodes them for us (Shift+Enter → `Enter` + `SHIFT`).
+const ENABLE_MODIFY_OTHER_KEYS: &str = "\x1b[>4;2m";
+/// Restore the terminal's default key reporting on teardown.
+const DISABLE_MODIFY_OTHER_KEYS: &str = "\x1b[>4;0m";
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -28,6 +37,8 @@ pub async fn run(base: String) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    write!(stdout, "{ENABLE_MODIFY_OTHER_KEYS}")?;
+    stdout.flush()?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -36,6 +47,7 @@ pub async fn run(base: String) -> anyhow::Result<()> {
 
     // Teardown — runs on both Ok and Err.
     disable_raw_mode()?;
+    let _ = write!(terminal.backend_mut(), "{DISABLE_MODIFY_OTHER_KEYS}");
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
@@ -268,6 +280,8 @@ fn fullscreen_attach(terminal: &mut Term, name: &str) {
         .status();
     let _ = enable_raw_mode();
     let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+    // tmux reset our key-reporting mode on detach; turn it back on.
+    let _ = write!(terminal.backend_mut(), "{ENABLE_MODIFY_OTHER_KEYS}");
     // Force a query-free full repaint. `Terminal::clear()` first queries the
     // cursor position over stdin, which races with the live crossterm
     // EventStream reader and silently no-ops (leaving tmux residue on screen);

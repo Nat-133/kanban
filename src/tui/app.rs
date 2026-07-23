@@ -4,7 +4,17 @@ use crate::model::proto::Intent;
 use crate::model::{Column, ColumnId, Task, TaskId};
 use crate::tui::client::Snapshot;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::Style;
 use ratatui_textarea::{CursorMove, TextArea};
+
+/// Build a modal text editor seeded with `lines`. Clears `ratatui-textarea`'s
+/// default cursor-line style, which otherwise underlines the whole line the
+/// cursor sits on.
+fn new_editor(lines: Vec<String>) -> TextArea<'static> {
+    let mut ta = TextArea::new(lines);
+    ta.set_cursor_line_style(Style::default());
+    ta
+}
 
 /// The result of handling a key: nothing, quit the loop, or send an intent.
 #[derive(Debug, Clone, PartialEq)]
@@ -269,7 +279,7 @@ impl App {
             Some(s) => s.split('\n').map(str::to_string).collect(),
             None => vec![String::new()],
         };
-        let mut editor = TextArea::new(lines);
+        let mut editor = new_editor(lines);
         // Start editing where the text ends, not at the top.
         editor.move_cursor(CursorMove::Bottom);
         editor.move_cursor(CursorMove::End);
@@ -371,7 +381,7 @@ impl App {
                 Action::None
             }
             KeyCode::Char('a') => {
-                self.editor = Some(TextArea::default());
+                self.editor = Some(new_editor(vec![String::new()]));
                 self.editing = None;
                 self.mode = Mode::AddTask;
                 Action::None
@@ -379,7 +389,7 @@ impl App {
             KeyCode::Char('e') => {
                 if let Some(t) = self.selected_task() {
                     let seed = self.task_combined_text(t).unwrap_or_default();
-                    let mut editor = TextArea::new(seed.split('\n').map(str::to_string).collect());
+                    let mut editor = new_editor(seed.split('\n').map(str::to_string).collect());
                     // Start editing where the text ends, not at the top.
                     editor.move_cursor(CursorMove::Bottom);
                     editor.move_cursor(CursorMove::End);

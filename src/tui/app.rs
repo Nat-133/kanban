@@ -5,14 +5,16 @@ use crate::model::{Column, ColumnId, Task, TaskId};
 use crate::tui::client::Snapshot;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Style;
-use ratatui_textarea::{CursorMove, TextArea};
+use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
 /// Build a modal text editor seeded with `lines`. Clears `ratatui-textarea`'s
-/// default cursor-line style, which otherwise underlines the whole line the
-/// cursor sits on.
+/// default cursor-line style (which otherwise underlines the whole cursor line)
+/// and soft-wraps long lines at word boundaries so text stays inside the box
+/// instead of scrolling off the right edge.
 fn new_editor(lines: Vec<String>) -> TextArea<'static> {
     let mut ta = TextArea::new(lines);
     ta.set_cursor_line_style(Style::default());
+    ta.set_wrap_mode(WrapMode::WordOrGlyph);
     ta
 }
 

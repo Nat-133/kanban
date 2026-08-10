@@ -446,10 +446,41 @@ impl Config {
 impl PermissionContext {
     /// Broad fallback used when config defines no contexts: allow the common
     /// local tools, ask on deliberately-visible outbound actions, deny nothing.
+    ///
+    /// Confluence lookup and editing are allowed outright — reading and writing
+    /// pages is routine enough that prompting for each call is pure friction.
+    /// Jira and Compass writes are deliberately absent, so they still ask.
     pub fn builtin_default() -> Self {
         let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
         PermissionContext {
-            allow: s(&["Bash", "Edit", "Write", "Read", "Glob", "Grep", "WebFetch", "WebSearch"]),
+            allow: s(&[
+                "Bash",
+                "Edit",
+                "Write",
+                "Read",
+                "Glob",
+                "Grep",
+                "WebFetch",
+                "WebSearch",
+                // Confluence lookup
+                "mcp__atlassian__getConfluencePage",
+                "mcp__atlassian__getConfluenceSpaces",
+                "mcp__atlassian__getPagesInConfluenceSpace",
+                "mcp__atlassian__getConfluencePageDescendants",
+                "mcp__atlassian__getConfluencePageFooterComments",
+                "mcp__atlassian__getConfluencePageInlineComments",
+                "mcp__atlassian__getConfluenceCommentChildren",
+                "mcp__atlassian__searchConfluenceUsingCql",
+                "mcp__atlassian__search",
+                "mcp__atlassian__fetch",
+                "mcp__atlassian__getAccessibleAtlassianResources",
+                "mcp__atlassian__atlassianUserInfo",
+                // Confluence editing
+                "mcp__atlassian__createConfluencePage",
+                "mcp__atlassian__updateConfluencePage",
+                "mcp__atlassian__createConfluenceFooterComment",
+                "mcp__atlassian__createConfluenceInlineComment",
+            ]),
             ask: s(&[
                 "Bash(git push:*)",
                 "Bash(git push --force:*)",

@@ -462,6 +462,12 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         let allow = v["permissions"]["allow"].as_array().unwrap();
         assert!(allow.iter().any(|x| x == "Bash"));
+        // Confluence lookup and editing reach the worker pre-approved, so routine
+        // page reads/writes don't prompt.
+        assert!(allow.iter().any(|x| x == "mcp__atlassian__getConfluencePage"));
+        assert!(allow.iter().any(|x| x == "mcp__atlassian__updateConfluencePage"));
+        // ...while Jira writes are not blanket-allowed, so they still ask.
+        assert!(!allow.iter().any(|x| x == "mcp__atlassian__editJiraIssue"));
         let ask = v["permissions"]["ask"].as_array().unwrap();
         assert!(ask.iter().any(|x| x.as_str().unwrap().contains("git push")));
         // hooks must still be present — permissions are ADDITIVE, not a replacement

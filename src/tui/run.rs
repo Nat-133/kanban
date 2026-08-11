@@ -3,8 +3,10 @@
 use crate::model::proto::Response;
 use crate::tui::app::{Action, App, Mode};
 use crate::tui::client::Client;
-use crate::tui::term::{handle_prefixed_key, popup_pty_size, TermAction, TermSession};
-use crossterm::event::{Event, KeyEventKind};
+use crate::tui::term::{
+    encode_mouse, handle_prefixed_key, mouse_cell, popup_pty_size, TermAction, TermSession,
+};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -34,12 +36,26 @@ pub async fn run(base: String) -> anyhow::Result<()> {
     // Run the loop, always restoring the terminal afterwards.
     let result = run_loop(&mut terminal, base).await;
 
-    // Teardown — runs on both Ok and Err.
+    // Teardown — runs on both Ok and Err. Mouse capture is normally released
+    // when the popup closes; disable it again in case we exited with one open.
+    set_mouse_capture(false);
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     result
+}
+
+/// Turn the outer terminal's mouse reporting on or off. Capture is held only
+/// while the embedded popup is open, so the board keeps the terminal's own
+/// click-drag text selection.
+fn set_mouse_capture(on: bool) {
+    let mut out = std::io::stdout();
+    let _ = if on {
+        execute!(out, EnableMouseCapture)
+    } else {
+        execute!(out, DisableMouseCapture)
+    };
 }
 
 /// What to do after routing a key while the terminal popup is open. Computed
@@ -67,6 +83,7 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
         // Reap a session whose child has exited (e.g. tmux detached/killed).
         if term.as_mut().map(|t| !t.is_alive()).unwrap_or(false) {
             term = None;
+            set_mouse_capture(false);
             app.exit_terminal();
         }
 
@@ -118,6 +135,7 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                                 Post::Nothing => {}
                                 Post::Close => {
                                     term = None;
+                                    set_mouse_capture(false);
                                     app.exit_terminal();
                                     refresh(&client, &mut app).await;
                                 }
@@ -125,6 +143,7 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                                     // Close the popup and repaint the board once,
                                     // then hand off to the full-screen attach.
                                     term = None;
+                                    set_mouse_capture(false);
                                     app.exit_terminal();
                                     terminal.draw(|f| crate::tui::ui::render(f, &app, None))?;
                                     fullscreen_attach(terminal, &name);
@@ -186,6 +205,23 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                             }
                         }
                     }
+                    // Mouse — forwarded to the inner session while the popup is
+                    // open (tmux with `mouse on` turns the wheel into scrollback).
+                    Some(Ok(Event::Mouse(me))) => {
+                        if let Some(t) = term.as_mut() {
+                            let size = terminal.size()?;
+                            if let Some((col, row)) = mouse_cell(size.width, size.height, me.column, me.row) {
+                                let (mode, encoding) = {
+                                    let p = t.parser().read().unwrap();
+                                    let s = p.screen();
+                                    (s.mouse_protocol_mode(), s.mouse_protocol_encoding())
+                                };
+                                if let Some(bytes) = encode_mouse(me, col, row, mode, encoding) {
+                                    let _ = t.write_input(&bytes);
+                                }
+                            }
+                        }
+                    }
                     // Terminal resize — keep the PTY in sync with the popup.
                     Some(Ok(Event::Resize(w, h))) => {
                         if let Some(t) = term.as_mut() {
@@ -240,6 +276,9 @@ fn open_terminal_popup(
     match TermSession::attach(name, rows, cols, redraw_tx.clone()) {
         Ok(t) => {
             *term = Some(t);
+            // Take the wheel and clicks off the outer terminal for as long as
+            // the popup is up, so they can be forwarded to the inner session.
+            set_mouse_capture(true);
             app.enter_terminal();
         }
         Err(e) => app.status = Some(e.to_string()),

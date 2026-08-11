@@ -4,7 +4,7 @@
 use std::io::{Read, Write};
 use std::sync::{Arc, RwLock};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use ratatui::layout::Rect;
 use ratatui::widgets::{Block, Borders, Clear};
@@ -251,6 +251,129 @@ pub fn popup_pty_size(width: u16, height: u16) -> (u16, u16) {
     (rows, cols)
 }
 
+/// The popup's inner area (inside the border) for a `width`×`height` terminal —
+/// the region whose cells correspond 1:1 to the PTY screen.
+pub fn popup_inner_rect(width: u16, height: u16) -> Rect {
+    let popup = centered_rect_pct(90, 90, Rect::new(0, 0, width, height));
+    Rect {
+        x: popup.x + 1,
+        y: popup.y + 1,
+        width: popup.width.saturating_sub(2),
+        height: popup.height.saturating_sub(2),
+    }
+}
+
+/// Translate an absolute terminal cell into a 0-based `(col, row)` inside the
+/// popup's inner area, or `None` if the cell falls outside it (on the border or
+/// on the board behind the popup).
+pub fn mouse_cell(width: u16, height: u16, col: u16, row: u16) -> Option<(u16, u16)> {
+    let inner = popup_inner_rect(width, height);
+    let in_x = col >= inner.x && col < inner.x + inner.width;
+    let in_y = row >= inner.y && row < inner.y + inner.height;
+    (in_x && in_y).then(|| (col - inner.x, row - inner.y))
+}
+
+/// The xterm button code for a mouse event kind, before modifier bits.
+/// `None` for kinds the protocol has no encoding for.
+fn button_code(kind: MouseEventKind) -> Option<u8> {
+    let base = |b: MouseButton| match b {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    };
+    match kind {
+        MouseEventKind::Down(b) => Some(base(b)),
+        // In the legacy encoding a release is always button 3; SGR keeps the
+        // real button and signals the release with a trailing `m` instead.
+        MouseEventKind::Up(b) => Some(base(b)),
+        // Motion sets bit 5 (32) on top of the held button, or of 3 when none is.
+        MouseEventKind::Drag(b) => Some(base(b) + 32),
+        MouseEventKind::Moved => Some(3 + 32),
+        MouseEventKind::ScrollUp => Some(64),
+        MouseEventKind::ScrollDown => Some(65),
+        MouseEventKind::ScrollLeft => Some(66),
+        MouseEventKind::ScrollRight => Some(67),
+    }
+}
+
+/// Whether `mode` asks for this kind of event at all. Forwarding a release or a
+/// motion to an app that only enabled press reporting would confuse it.
+fn mode_wants(mode: tui_term::vt100::MouseProtocolMode, kind: MouseEventKind) -> bool {
+    use tui_term::vt100::MouseProtocolMode as M;
+    match kind {
+        MouseEventKind::Down(_)
+        | MouseEventKind::ScrollUp
+        | MouseEventKind::ScrollDown
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => mode != M::None,
+        MouseEventKind::Up(_) => matches!(m_rank(mode), 2..=4),
+        MouseEventKind::Drag(_) => matches!(m_rank(mode), 3..=4),
+        MouseEventKind::Moved => m_rank(mode) == 4,
+    }
+}
+
+/// Ordinal for a mouse mode, so the reporting levels can be compared.
+fn m_rank(mode: tui_term::vt100::MouseProtocolMode) -> u8 {
+    use tui_term::vt100::MouseProtocolMode as M;
+    match mode {
+        M::None => 0,
+        M::Press => 1,
+        M::PressRelease => 2,
+        M::ButtonMotion => 3,
+        M::AnyMotion => 4,
+    }
+}
+
+/// Encode a mouse event at 0-based inner-screen cell `(col, row)` as the bytes
+/// the inner application expects, given the mouse protocol it enabled. Returns
+/// `None` when the event should not be reported: mouse handling is off, the
+/// mode doesn't cover this kind of event, or the legacy encoding cannot express
+/// the coordinates.
+pub fn encode_mouse(
+    ev: MouseEvent,
+    col: u16,
+    row: u16,
+    mode: tui_term::vt100::MouseProtocolMode,
+    encoding: tui_term::vt100::MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    use tui_term::vt100::MouseProtocolEncoding as E;
+
+    if !mode_wants(mode, ev.kind) {
+        return None;
+    }
+    let mut button = button_code(ev.kind)?;
+    if ev.modifiers.contains(KeyModifiers::SHIFT) {
+        button += 4;
+    }
+    if ev.modifiers.contains(KeyModifiers::ALT) {
+        button += 8;
+    }
+    if ev.modifiers.contains(KeyModifiers::CONTROL) {
+        button += 16;
+    }
+
+    // The wire protocol is 1-based.
+    let (x, y) = (col + 1, row + 1);
+    match encoding {
+        E::Sgr => {
+            let final_byte = if matches!(ev.kind, MouseEventKind::Up(_)) { 'm' } else { 'M' };
+            Some(format!("\x1b[<{button};{x};{y}{final_byte}").into_bytes())
+        }
+        // The legacy (and UTF-8) encodings carry each field in a single byte
+        // offset by 32, so they cannot express a coordinate past 223.
+        E::Default | E::Utf8 => {
+            if matches!(ev.kind, MouseEventKind::Up(_)) {
+                // No per-button releases here: 3 means "some button came up".
+                button = 3 + (button & !3);
+            }
+            if x > 223 || y > 223 {
+                return None;
+            }
+            Some(vec![0x1b, b'[', b'M', 32 + button, 32 + x as u8, 32 + y as u8])
+        }
+    }
+}
+
 /// The argv for attaching to a tmux session by name.
 pub fn tmux_attach_argv(session: &str) -> Vec<String> {
     vec![
@@ -371,6 +494,127 @@ mod tests {
         let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("hello-pty"), "popup should display PTY output");
         assert!(text.contains("kanban-task-0001"), "popup border should show the session title");
+    }
+
+    use tui_term::vt100::{MouseProtocolEncoding as Enc, MouseProtocolMode as Mode};
+
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent { kind, column: 0, row: 0, modifiers: KeyModifiers::NONE }
+    }
+
+    /// Encode at inner cell (0,0) with the given protocol, as a string.
+    fn enc(kind: MouseEventKind, mode: Mode, encoding: Enc) -> Option<String> {
+        encode_mouse(mouse(kind), 0, 0, mode, encoding)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+
+    #[test]
+    fn sgr_wheel_up_and_down_are_buttons_64_and_65() {
+        assert_eq!(
+            enc(MouseEventKind::ScrollUp, Mode::PressRelease, Enc::Sgr).as_deref(),
+            Some("\x1b[<64;1;1M")
+        );
+        assert_eq!(
+            enc(MouseEventKind::ScrollDown, Mode::PressRelease, Enc::Sgr).as_deref(),
+            Some("\x1b[<65;1;1M")
+        );
+    }
+
+    #[test]
+    fn sgr_coordinates_are_one_based() {
+        let ev = mouse(MouseEventKind::ScrollUp);
+        let bytes = encode_mouse(ev, 4, 9, Mode::PressRelease, Enc::Sgr).unwrap();
+        assert_eq!(String::from_utf8_lossy(&bytes), "\x1b[<64;5;10M");
+    }
+
+    #[test]
+    fn sgr_release_keeps_the_button_and_ends_with_lowercase_m() {
+        assert_eq!(
+            enc(MouseEventKind::Up(MouseButton::Right), Mode::PressRelease, Enc::Sgr).as_deref(),
+            Some("\x1b[<2;1;1m")
+        );
+    }
+
+    #[test]
+    fn sgr_drag_sets_the_motion_bit() {
+        assert_eq!(
+            enc(MouseEventKind::Drag(MouseButton::Left), Mode::ButtonMotion, Enc::Sgr).as_deref(),
+            Some("\x1b[<32;1;1M")
+        );
+    }
+
+    #[test]
+    fn modifier_bits_are_added_to_the_button() {
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            // shift 4 + alt 8 + ctrl 16 = 28.
+            modifiers: KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+        };
+        let bytes = encode_mouse(ev, 0, 0, Mode::Press, Enc::Sgr).unwrap();
+        assert_eq!(String::from_utf8_lossy(&bytes), "\x1b[<28;1;1M");
+    }
+
+    #[test]
+    fn default_encoding_offsets_every_field_by_32() {
+        let ev = mouse(MouseEventKind::ScrollDown);
+        let bytes = encode_mouse(ev, 2, 3, Mode::PressRelease, Enc::Default).unwrap();
+        assert_eq!(bytes, vec![0x1b, b'[', b'M', 32 + 65, 32 + 3, 32 + 4]);
+    }
+
+    #[test]
+    fn default_encoding_reports_release_as_button_3() {
+        let ev = mouse(MouseEventKind::Up(MouseButton::Right));
+        let bytes = encode_mouse(ev, 0, 0, Mode::PressRelease, Enc::Default).unwrap();
+        assert_eq!(bytes[3], 32 + 3);
+    }
+
+    #[test]
+    fn default_encoding_drops_coordinates_past_223() {
+        let ev = mouse(MouseEventKind::Down(MouseButton::Left));
+        assert!(encode_mouse(ev, 223, 0, Mode::Press, Enc::Default).is_none());
+        // The last expressible column still encodes.
+        assert!(encode_mouse(ev, 222, 0, Mode::Press, Enc::Default).is_some());
+    }
+
+    #[test]
+    fn mouse_off_forwards_nothing() {
+        assert_eq!(enc(MouseEventKind::ScrollUp, Mode::None, Enc::Sgr), None);
+    }
+
+    #[test]
+    fn press_only_mode_drops_release_and_motion() {
+        assert_eq!(enc(MouseEventKind::Up(MouseButton::Left), Mode::Press, Enc::Sgr), None);
+        assert_eq!(enc(MouseEventKind::Drag(MouseButton::Left), Mode::Press, Enc::Sgr), None);
+        assert!(enc(MouseEventKind::Down(MouseButton::Left), Mode::Press, Enc::Sgr).is_some());
+    }
+
+    #[test]
+    fn button_motion_mode_drops_buttonless_movement() {
+        assert_eq!(enc(MouseEventKind::Moved, Mode::ButtonMotion, Enc::Sgr), None);
+        assert_eq!(
+            enc(MouseEventKind::Moved, Mode::AnyMotion, Enc::Sgr).as_deref(),
+            Some("\x1b[<35;1;1M")
+        );
+    }
+
+    #[test]
+    fn mouse_cell_maps_the_inner_areas_top_left_to_origin() {
+        // 100×100 terminal → popup at (5,5) 90×90 → inner area at (6,6) 88×88.
+        assert_eq!(popup_inner_rect(100, 100), Rect::new(6, 6, 88, 88));
+        assert_eq!(mouse_cell(100, 100, 6, 6), Some((0, 0)));
+        assert_eq!(mouse_cell(100, 100, 93, 93), Some((87, 87)));
+    }
+
+    #[test]
+    fn mouse_cell_rejects_the_border_and_the_board_behind_it() {
+        // The popup's own border row/column…
+        assert_eq!(mouse_cell(100, 100, 5, 5), None);
+        // …the first cell past the inner area…
+        assert_eq!(mouse_cell(100, 100, 94, 93), None);
+        // …and the board outside the popup entirely.
+        assert_eq!(mouse_cell(100, 100, 0, 0), None);
     }
 
     fn sh(script: &str) -> portable_pty::CommandBuilder {

@@ -9,6 +9,7 @@ pub fn derive(events: &[WorkerEvent]) -> Phase {
         Some(WorkerEventKind::HumanInputRequired(Notification::PermissionPrompt)) => Phase::WaitingHuman,
         Some(WorkerEventKind::HumanInputRequired(Notification::IdlePrompt)) => Phase::Idle,
         Some(WorkerEventKind::Completed) => Phase::Completed,
+        Some(WorkerEventKind::Interrupted) => Phase::Interrupted,
         Some(WorkerEventKind::Failed) => Phase::Failed,
     }
 }

@@ -78,7 +78,7 @@ pub fn render(f: &mut Frame, app: &App, term_screen: Option<&tui_term::vt100::Sc
                         Some(Phase::Working) => {
                             Span::raw(format!("{} ", spinner_frame(app.spinner_tick())))
                         }
-                        Some(Phase::Idle | Phase::WaitingHuman | Phase::Failed) => {
+                        Some(Phase::Idle | Phase::WaitingHuman | Phase::Failed | Phase::Interrupted) => {
                             let icon_style = if selected {
                                 Style::default()
                             } else {
@@ -105,7 +105,7 @@ pub fn render(f: &mut Frame, app: &App, term_screen: Option<&tui_term::vt100::Sc
         Paragraph::new(format!("/{}", app.filter())).style(Style::default().fg(Color::Yellow))
     } else {
         Paragraph::new(
-            "h/l/j/k move · H/L move card · J/K reorder · a add · e edit · / search · c hand off · d archive · ? help · q quit",
+            "h/l/j/k move · H/L move card · J/K reorder · a add · e edit · / search · c hand off · t open agent · d archive · ? help · q quit",
         )
         .style(Style::default().fg(Color::DarkGray))
     };
@@ -136,6 +136,8 @@ pub fn render(f: &mut Frame, app: &App, term_screen: Option<&tui_term::vt100::Sc
                 "  a            add task",
                 "  Enter        open task detail (e edits description)",
                 "  c            hand off selected task",
+                "  t / T        open the agent's session (popup / fullscreen);",
+                "               resumes it first if it was interrupted",
                 "  d            archive selected task",
                 "  ?            toggle this help",
                 "  q            quit",
@@ -396,6 +398,15 @@ mod tests {
             assert!(text.contains("Buy milk"), "{phase:?}: title missing");
             assert!(text.contains(WARNING), "{phase:?}: warning icon missing");
         }
+    }
+
+    #[test]
+    fn renders_warning_icon_for_interrupted() {
+        // An agent the machine killed needs a human to resume it — same class of
+        // attention as an idle prompt, and definitely not a spinner.
+        let text = render_with_phase(crate::model::Phase::Interrupted);
+        assert!(text.contains(WARNING), "interrupted must warn");
+        assert!(!text.contains(spinner_frame(0)), "interrupted must not spin");
     }
 
     #[test]

@@ -28,6 +28,11 @@ pub enum Action {
     OpenTerminal(String),
     /// Attach to the named tmux session full-screen (suspending the TUI).
     AttachFullscreen(String),
+    /// Bring a killed agent back and then open it. The relaunch has to land
+    /// before there is anything to attach to, so the run loop sends the resume
+    /// intent first and opens the session once it succeeds. `fullscreen` carries
+    /// which way the operator asked to open it.
+    ResumeAndOpen { task: TaskId, fullscreen: bool },
 }
 
 /// The current input mode of the app.
@@ -217,6 +222,21 @@ impl App {
         self.snapshot.descriptions.get(&id).map(String::as_str)
     }
 
+    /// Open the selected task's worker session. An interrupted agent — one a
+    /// crash or shutdown killed — has no terminal session left to attach to, so
+    /// opening it resumes it first; the caller attaches once the relaunch lands.
+    /// A running agent is attached to directly, never resumed, so opening a
+    /// session can't put two agents on one task.
+    fn open_session(&self, fullscreen: bool) -> Action {
+        let Some(task) = self.selected_task() else { return Action::None };
+        let Some(session) = self.session_for(task) else { return Action::None };
+        if session.phase == crate::model::Phase::Interrupted {
+            return Action::ResumeAndOpen { task, fullscreen };
+        }
+        let name = session.session_name.clone();
+        if fullscreen { Action::AttachFullscreen(name) } else { Action::OpenTerminal(name) }
+    }
+
     fn clamp(&mut self) {
         let ncols = self.columns().len();
         if ncols == 0 {
@@ -370,18 +390,8 @@ impl App {
                 }
                 Action::None
             }
-            KeyCode::Char('t') => {
-                if let Some(name) = self.selected_task().and_then(|t| self.session_for(t)).map(|s| s.session_name.clone()) {
-                    return Action::OpenTerminal(name);
-                }
-                Action::None
-            }
-            KeyCode::Char('T') => {
-                if let Some(name) = self.selected_task().and_then(|t| self.session_for(t)).map(|s| s.session_name.clone()) {
-                    return Action::AttachFullscreen(name);
-                }
-                Action::None
-            }
+            KeyCode::Char('t') => self.open_session(false),
+            KeyCode::Char('T') => self.open_session(true),
             KeyCode::Char('a') => {
                 self.editor = Some(new_editor(vec![String::new()]));
                 self.editing = None;
@@ -659,6 +669,39 @@ mod tests {
     fn d_emits_archive_intent() {
         let mut app = App::new(snap());
         assert_eq!(app.on_key(key('d')), Action::Send(Intent::ArchiveTask { task: TaskId::new(1) }));
+    }
+
+    fn snap_with_phase(phase: crate::model::Phase) -> Snapshot {
+        let mut s = snap();
+        s.sessions = vec![crate::model::proto::SessionView {
+            task: TaskId::new(1),
+            session_name: "kanban-task-0001".into(),
+            phase,
+            needs_human_input: phase.needs_human_input(),
+        }];
+        s
+    }
+
+    #[test]
+    fn t_resumes_an_interrupted_session_instead_of_attaching_to_a_dead_one() {
+        // Opening a session the machine killed brings it back: attaching to its
+        // vanished tmux session would just fail.
+        let mut app = App::new(snap_with_phase(crate::model::Phase::Interrupted));
+        assert_eq!(app.on_key(key('t')), Action::ResumeAndOpen { task: TaskId::new(1), fullscreen: false });
+    }
+
+    #[test]
+    fn shift_t_resumes_an_interrupted_session_too() {
+        let mut app = App::new(snap_with_phase(crate::model::Phase::Interrupted));
+        assert_eq!(app.on_key(key('T')), Action::ResumeAndOpen { task: TaskId::new(1), fullscreen: true });
+    }
+
+    #[test]
+    fn t_does_not_resume_a_session_that_is_still_running() {
+        // Resume is recovery, not restart: resuming a live agent would run two
+        // agents against one task.
+        let mut app = App::new(snap_with_phase(crate::model::Phase::Working));
+        assert_eq!(app.on_key(key('t')), Action::OpenTerminal("kanban-task-0001".into()));
     }
 
     #[test]

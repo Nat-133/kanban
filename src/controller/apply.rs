@@ -52,6 +52,7 @@ pub fn apply(root: &Path, intent: Intent) -> anyhow::Result<Response> {
         Intent::MoveCard { task, to_column, position } => move_card(root, task, to_column, position),
         Intent::ReorderCard { task, position } => reorder_card(root, task, position),
         Intent::ArchiveTask { task } => archive(root, task, &handoff::TmuxLauncher),
+        Intent::ResumeSession { task } => resume(root, task, &handoff::TmuxLauncher),
         Intent::SetProfile { task, profile } => set_profile(root, task, profile),
         Intent::Handoff { task, worker } => {
             match handoff::handoff(root, task, &worker, &handoff::TmuxLauncher) {
@@ -193,6 +194,63 @@ fn reorder_card(root: &Path, task_id: TaskId, position: usize) -> anyhow::Result
         Err(e) => return Ok(Response::Error { message: e.to_string() }),
     };
     store::save_board(root, &board)?;
+    Ok(Response::Ok { task: Some(task_id) })
+}
+
+/// Relaunch a worker whose terminal session is gone, continuing its own
+/// transcript where one was captured.
+///
+/// Recovery is deliberately operator-triggered rather than automatic: relaunching
+/// every dead agent on daemon start would resurrect work the human may have
+/// abandoned on purpose. Refuses while the session is still alive, so a
+/// mis-keyed resume can't run two agents against one task.
+fn resume(root: &Path, task_id: TaskId, launcher: &dyn handoff::Launcher) -> anyhow::Result<Response> {
+    let Some(mut session) = store::load_session(root, task_id)? else {
+        return Ok(Response::Error { message: format!("no worker session for {task_id}") });
+    };
+    let session_name = session.spec.session_name.clone().unwrap_or_default();
+    if launcher.is_alive(&session_name) {
+        return Ok(Response::Error {
+            message: format!("{task_id} is still running in {session_name}"),
+        });
+    }
+    // Continue the agent's own transcript when we captured its id. Without one
+    // (it died before SessionStart ever fired) there is nothing to resume, so it
+    // starts fresh from the handoff rather than refusing to come back at all.
+    let mut command = session.spec.command.clone();
+    if let Some(sid) = session.status.session_id.clone() {
+        match command.iter().position(|a| a == "--resume") {
+            // A previous resume left a flag behind. Overwrite its value rather
+            // than skipping: the relaunched agent reports its own session id, so
+            // the recorded one is the live transcript and the old one is stale.
+            // `get_mut` rather than indexing: a hand-edited session.yaml could
+            // leave a trailing `--resume` with no value, and that must not panic
+            // the daemon.
+            Some(at) => match command.get_mut(at + 1) {
+                Some(slot) => *slot = sid,
+                None => command.push(sid),
+            },
+            // Right after the worker binary: the trailing positional prompt must
+            // stay non-leading, and the variadic `--add-dir` must stay last.
+            None => {
+                command.insert(1, sid);
+                command.insert(1, "--resume".to_string());
+            }
+        }
+    }
+    session.spec.command = command;
+    launcher.launch(&session, &session_name)?;
+    store::save_session(root, &session)?;
+    // Assert the running state immediately rather than waiting for the relaunched
+    // agent's SessionStart hook, so the board reflects the resume at once.
+    let event = WorkerEvent {
+        kind: WorkerEventKind::Started,
+        source: "resume".to_string(),
+        observed_at: time::OffsetDateTime::now_utc(),
+        payload_ref: None,
+    };
+    store::save_state(root, task_id, &event)?;
+    crate::controller::events::ingest_session(root, task_id)?;
     Ok(Response::Ok { task: Some(task_id) })
 }
 
@@ -338,6 +396,7 @@ mod tests {
     impl crate::controller::handoff::Launcher for NoLaunch {
         fn launch(&self, _s: &crate::model::WorkerSession, _n: &str) -> anyhow::Result<()> { Ok(()) }
         fn kill(&self, _n: &str) {}
+        fn is_alive(&self, _n: &str) -> bool { true }
     }
 
     #[test]
@@ -462,6 +521,7 @@ mod tests {
     impl handoff::Launcher for FakeLauncher {
         fn launch(&self, _session: &WorkerSession, _session_name: &str) -> anyhow::Result<()> { Ok(()) }
         fn kill(&self, session_name: &str) { self.killed.lock().unwrap().push(session_name.to_string()); }
+        fn is_alive(&self, _n: &str) -> bool { true }
     }
 
     #[test]
@@ -523,6 +583,123 @@ mod tests {
         assert!(acts.iter().any(|a| matches!(&a.kind,
             activity::ActivityKind::ProfileChanged { from, to }
                 if from.is_none() && to == "cluster-ops")));
+    }
+
+    /// Records what it was asked to launch, and reports every session dead — the
+    /// state the world is in after a shutdown killed the agents.
+    #[derive(Default)]
+    struct DeadLauncher {
+        launched: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+    impl handoff::Launcher for DeadLauncher {
+        fn launch(&self, session: &WorkerSession, _n: &str) -> anyhow::Result<()> {
+            self.launched.lock().unwrap().push(session.spec.command.clone());
+            Ok(())
+        }
+        fn kill(&self, _n: &str) {}
+        fn is_alive(&self, _n: &str) -> bool { false }
+    }
+
+    /// Hand off task 1, record the agent's session id, then have it interrupted.
+    fn interrupted_task(r: &Path) -> TaskId {
+        apply(r, Intent::CreateTask { text: "A".into(), column: col("todo") }).unwrap();
+        let id = TaskId::new(1);
+        handoff::handoff(r, id, "claude", &NoLaunch).unwrap();
+        crate::controller::events::record_state(r, id, "session-start", "{\"session_id\":\"abc-123\"}").unwrap();
+        crate::controller::events::record_state(r, id, "session-end", "{\"reason\":\"other\"}").unwrap();
+        crate::controller::events::ingest_session(r, id).unwrap();
+        id
+    }
+
+    #[test]
+    fn resume_relaunches_the_agent_with_its_own_session_id() {
+        let d = setup(); let r = root(&d);
+        let id = interrupted_task(&r);
+        assert_eq!(crate::controller::events::session_phase(&r, id).unwrap(), Phase::Interrupted);
+        let launcher = DeadLauncher::default();
+
+        let resp = resume(&r, id, &launcher).unwrap();
+
+        assert_eq!(resp, Response::Ok { task: Some(id) });
+        let cmds = launcher.launched.lock().unwrap();
+        assert_eq!(cmds.len(), 1);
+        let cmd = &cmds[0];
+        let at = cmd.iter().position(|a| a == "--resume").expect("resume flag");
+        assert_eq!(cmd[at + 1], "abc-123");
+        // The agent is running again: back to working, card in doing.
+        assert_eq!(crate::controller::events::session_phase(&r, id).unwrap(), Phase::Working);
+        let board = store::load_board(&r).unwrap();
+        assert!(board.cards().get(&col("doing")).unwrap().contains(&id));
+    }
+
+    #[test]
+    fn resume_does_not_stack_resume_flags_when_run_twice() {
+        let d = setup(); let r = root(&d);
+        let id = interrupted_task(&r);
+        let launcher = DeadLauncher::default();
+        resume(&r, id, &launcher).unwrap();
+        resume(&r, id, &launcher).unwrap();
+        let cmds = launcher.launched.lock().unwrap();
+        assert_eq!(cmds[1].iter().filter(|a| *a == "--resume").count(), 1);
+    }
+
+    #[test]
+    fn resume_uses_the_latest_session_id_not_a_stale_one() {
+        // The relaunched agent reports its own session id via SessionStart. A
+        // second resume must continue THAT transcript, not the one recorded
+        // before the first resume.
+        let d = setup(); let r = root(&d);
+        let id = interrupted_task(&r);
+        let launcher = DeadLauncher::default();
+        resume(&r, id, &launcher).unwrap();
+        crate::controller::events::record_state(&r, id, "session-start", "{\"session_id\":\"def-456\"}").unwrap();
+        crate::controller::events::record_state(&r, id, "session-end", "{\"reason\":\"other\"}").unwrap();
+
+        resume(&r, id, &launcher).unwrap();
+
+        let cmds = launcher.launched.lock().unwrap();
+        let cmd = &cmds[1];
+        let at = cmd.iter().position(|a| a == "--resume").expect("resume flag");
+        assert_eq!(cmd[at + 1], "def-456");
+        assert!(!cmd.contains(&"abc-123".to_string()), "stale session id must not survive");
+    }
+
+    #[test]
+    fn resume_refuses_while_the_agent_is_still_running() {
+        let d = setup(); let r = root(&d);
+        let id = interrupted_task(&r);
+        // NoLaunch reports every session alive.
+        match resume(&r, id, &NoLaunch).unwrap() {
+            Response::Error { message } => assert!(message.contains("still running"), "{message}"),
+            o => panic!("expected an error, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_without_a_session_errors() {
+        let d = setup(); let r = root(&d);
+        apply(&r, Intent::CreateTask { text: "A".into(), column: col("todo") }).unwrap();
+        match resume(&r, TaskId::new(1), &DeadLauncher::default()).unwrap() {
+            Response::Error { message } => assert!(message.contains("no worker session"), "{message}"),
+            o => panic!("expected an error, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_without_a_captured_session_id_starts_the_agent_fresh() {
+        // No session_id was ever captured (the agent died before SessionStart), so
+        // there is no transcript to resume — relaunch rather than refuse.
+        let d = setup(); let r = root(&d);
+        apply(&r, Intent::CreateTask { text: "A".into(), column: col("todo") }).unwrap();
+        let id = TaskId::new(1);
+        handoff::handoff(&r, id, "claude", &NoLaunch).unwrap();
+        crate::controller::events::record_state(&r, id, "session-end", "{\"reason\":\"other\"}").unwrap();
+        let launcher = DeadLauncher::default();
+
+        resume(&r, id, &launcher).unwrap();
+
+        let cmds = launcher.launched.lock().unwrap();
+        assert!(!cmds[0].contains(&"--resume".to_string()));
     }
 
     #[test]

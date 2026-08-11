@@ -201,6 +201,34 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                                     fullscreen_attach(terminal, &name);
                                     refresh(&client, &mut app).await;
                                 }
+                                // Opening a session a crash or shutdown killed:
+                                // bring the agent back, then attach the way the
+                                // operator asked. Only attach if the relaunch
+                                // actually succeeded — attaching after a failed
+                                // resume would just fail again, hiding the reason.
+                                Action::ResumeAndOpen { task, fullscreen } => {
+                                    match client.send(crate::model::proto::Intent::ResumeSession { task }).await {
+                                        Ok(Response::Ok { .. }) => {
+                                            refresh(&client, &mut app).await;
+                                            let name = app
+                                                .session_for(task)
+                                                .map(|s| s.session_name.clone())
+                                                .filter(|n| !n.is_empty());
+                                            if let Some(name) = name {
+                                                app.status = Some(format!("resumed {task}"));
+                                                if fullscreen {
+                                                    fullscreen_attach(terminal, &name);
+                                                    refresh(&client, &mut app).await;
+                                                } else {
+                                                    open_terminal_popup(&name, terminal, &mut term, &mut app, &redraw_tx);
+                                                }
+                                            }
+                                        }
+                                        Ok(Response::Error { message }) => app.status = Some(message),
+                                        Ok(_) => refresh(&client, &mut app).await,
+                                        Err(e) => app.status = Some(e.to_string()),
+                                    }
+                                }
                                 Action::None => {}
                             }
                         }

@@ -24,7 +24,19 @@ fn to_event(item: &IntakePayload) -> Option<WorkerEvent> {
         // human — it is waiting for a response, not working. Treat it as idle so
         // the card flips to the warning, not the spinner.
         "stop" => WorkerEventKind::HumanInputRequired(Notification::IdlePrompt),
-        "session-end" => WorkerEventKind::Completed,
+        // SessionEnd fires on ANY teardown — a deliberate exit, a `/clear`, a
+        // logout, or the terminal dying under the agent at laptop shutdown. Only
+        // the human closing the session by hand means the work is finished, so we
+        // key on `reason` and default everything else to interrupted: an
+        // unrecognised (or future) reason must never complete a ticket.
+        "session-end" => match item.payload.get("reason").and_then(|v| v.as_str()) {
+            Some("prompt_input_exit") => WorkerEventKind::Completed,
+            // `clear` is not an ending at all: the agent keeps running in the same
+            // terminal session and a SessionStart follows. Leave the state alone,
+            // so the card neither moves nor offers a resume for a live agent.
+            Some("clear") => return None,
+            _ => WorkerEventKind::Interrupted,
+        },
         "stop-failure" => WorkerEventKind::Failed,
         "notification" => match item.payload.get("notification_type").and_then(|v| v.as_str()) {
             Some("permission_prompt") => WorkerEventKind::HumanInputRequired(Notification::PermissionPrompt),
@@ -154,7 +166,7 @@ pub fn session_phase(root: &Path, id: TaskId) -> anyhow::Result<Phase> {
 /// None = leave the card where it is.
 fn phase_column(phase: Phase) -> Option<&'static str> {
     match phase {
-        Phase::Working | Phase::WaitingHuman | Phase::Idle | Phase::Failed => Some("doing"),
+        Phase::Working | Phase::WaitingHuman | Phase::Idle | Phase::Failed | Phase::Interrupted => Some("doing"),
         Phase::Completed => Some("done"),
         Phase::Pending => None,
     }
@@ -346,19 +358,70 @@ mod tests {
         assert!(board.cards().get(&"doing".parse().unwrap()).unwrap().contains(&id));
     }
 
-    #[test]
-    fn ingest_session_end_moves_to_done() {
+    /// Create task 1 in `todo` in a fresh workspace.
+    fn workspace_with_task() -> (tempfile::TempDir, std::path::PathBuf, TaskId) {
         use crate::controller::apply::apply;
         use crate::model::proto::Intent;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
         store::init_workspace(&root).unwrap();
         apply(&root, Intent::CreateTask { text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
-        let id = TaskId::new(1);
-        record_state(&root, id, "session-end", "{}").unwrap();
+        (dir, root, TaskId::new(1))
+    }
+
+    fn column_of(root: &Path, id: TaskId) -> Option<String> {
+        let board = store::load_board(root).unwrap();
+        board.cards().iter().find(|(_, v)| v.contains(&id)).map(|(c, _)| c.to_string())
+    }
+
+    #[test]
+    fn deliberate_exit_moves_to_done() {
+        let (_d, root, id) = workspace_with_task();
+        // The human ran `exit` / Ctrl-D: the only signal that means "finished".
+        record_state(&root, id, "session-end", "{\"reason\":\"prompt_input_exit\"}").unwrap();
         ingest_session(&root, id).unwrap();
-        let board = store::load_board(&root).unwrap();
-        assert!(board.cards().get(&"done".parse().unwrap()).unwrap().contains(&id));
+        assert_eq!(column_of(&root, id).as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn session_end_without_deliberate_exit_is_interrupted_and_stays_in_doing() {
+        // The shutdown case: the session was torn down under the agent. This must
+        // never read as completed work.
+        for reason in ["\"other\"", "\"logout\"", "\"some_future_reason\"", "null"] {
+            let (_d, root, id) = workspace_with_task();
+            record_state(&root, id, "user-prompt-submit", "{}").unwrap(); // Working
+            ingest_session(&root, id).unwrap();
+
+            record_state(&root, id, "session-end", &format!("{{\"reason\":{reason}}}")).unwrap();
+            ingest_session(&root, id).unwrap();
+
+            assert_eq!(session_phase(&root, id).unwrap(), Phase::Interrupted, "reason {reason}");
+            assert_eq!(column_of(&root, id).as_deref(), Some("doing"), "reason {reason}");
+        }
+    }
+
+    #[test]
+    fn session_end_with_no_reason_at_all_is_interrupted() {
+        // A hook firing with no reason field is indistinguishable from a crash.
+        let (_d, root, id) = workspace_with_task();
+        record_state(&root, id, "session-end", "{}").unwrap();
+        assert_eq!(session_phase(&root, id).unwrap(), Phase::Interrupted);
+        ingest_session(&root, id).unwrap();
+        assert_eq!(column_of(&root, id).as_deref(), Some("doing"));
+    }
+
+    #[test]
+    fn clear_is_not_an_ending_and_leaves_state_untouched() {
+        // `clear` fires SessionEnd but the agent keeps running in the same tmux
+        // session, with a SessionStart to follow. Neither move nor mark the card.
+        let (_d, root, id) = workspace_with_task();
+        record_state(&root, id, "user-prompt-submit", "{}").unwrap(); // Working
+
+        let tracked = record_state(&root, id, "session-end", "{\"reason\":\"clear\"}").unwrap();
+
+        assert!(!tracked, "clear must not wake the controller");
+        assert_eq!(store::load_state(&root, id).unwrap().unwrap().kind, WorkerEventKind::Working);
+        assert_eq!(session_phase(&root, id).unwrap(), Phase::Working);
     }
 
     #[test]
@@ -422,6 +485,7 @@ mod tests {
         impl handoff::Launcher for NoLaunch {
             fn launch(&self, _s: &crate::model::WorkerSession, _n: &str) -> anyhow::Result<()> { Ok(()) }
             fn kill(&self, _n: &str) {}
+            fn is_alive(&self, _n: &str) -> bool { true }
         }
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
@@ -450,6 +514,7 @@ mod tests {
         impl handoff::Launcher for NoLaunch {
             fn launch(&self, _s: &crate::model::WorkerSession, _n: &str) -> anyhow::Result<()> { Ok(()) }
             fn kill(&self, _n: &str) {}
+            fn is_alive(&self, _n: &str) -> bool { true }
         }
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");
@@ -480,6 +545,7 @@ mod tests {
         impl handoff::Launcher for NoLaunch {
             fn launch(&self, _s: &crate::model::WorkerSession, _n: &str) -> anyhow::Result<()> { Ok(()) }
             fn kill(&self, _n: &str) {}
+            fn is_alive(&self, _n: &str) -> bool { true }
         }
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".kanban");

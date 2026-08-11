@@ -1,7 +1,7 @@
 // http server — Task 5
 
 use crate::controller::apply::apply;
-use crate::controller::{events, store};
+use crate::controller::{events, handoff, store};
 use crate::model::proto::{Intent, Response, WakeRequest};
 use crate::model::TaskId;
 use axum::response::sse::{Event, Sse};
@@ -19,6 +19,13 @@ use tokio_stream::wrappers::BroadcastStream;
 /// the UI can see changed — covering the rare case where a poke can't be delivered
 /// (no daemon was up at hook time, or it restarted on a different port).
 const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Liveness sweep cadence. Deliberately far slower than the reconcile pass: it
+/// shells out to the multiplexer once per running session, and an agent dying
+/// without a hook firing is rare enough that noticing within half a minute is
+/// ample. The sweep that matters most runs once at startup, catching every
+/// session the machine killed while the daemon was down.
+const LIVENESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// File under the workspace root holding the daemon's bound address (e.g.
 /// `127.0.0.1:7777`). Written on startup so the hook process can find the daemon
@@ -127,6 +134,13 @@ pub async fn serve(root: PathBuf, addr: std::net::SocketAddr) -> anyhow::Result<
     // ENOENT on every request (e.g. when launched from the wrong directory).
     crate::controller::store::ensure_workspace(&root)?;
 
+    // Startup recovery. Any session still claiming to be working is either a live
+    // agent we're reconnecting to or one the machine killed while we were down —
+    // probe before serving so the first board the UI renders tells the truth.
+    if let Err(e) = crate::controller::recover::reconcile_liveness(&root, &handoff::TmuxLauncher) {
+        tracing::warn!(error = %e, "startup liveness sweep failed");
+    }
+
     let (tx, _rx) = broadcast::channel(64);
     // Periodic reconcile: re-read every session's state, move cards to match, and
     // broadcast whenever the observable state (board layout OR any session's phase)
@@ -156,6 +170,31 @@ pub async fn serve(root: PathBuf, addr: std::net::SocketAddr) -> anyhow::Result<
             }
         });
     }
+    // Periodic liveness sweep: catches an agent that dies mid-session without its
+    // SessionEnd hook ever firing. Broadcasts only when it actually marked
+    // something, so a quiet sweep costs the UI nothing.
+    {
+        let root = root.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(LIVENESS_INTERVAL);
+            tick.tick().await; // the immediate first tick is the startup sweep we just ran
+            loop {
+                tick.tick().await;
+                let r = root.clone();
+                let changed = tokio::task::spawn_blocking(move || {
+                    crate::controller::recover::reconcile_liveness(&r, &handoff::TmuxLauncher)
+                })
+                .await;
+                match changed {
+                    Ok(Ok(true)) => { let _ = tx.send(()); }
+                    Ok(Err(e)) => tracing::warn!(error = %e, "liveness sweep failed"),
+                    _ => {}
+                }
+            }
+        });
+    }
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     // Publish where we're listening so hook processes can poke us.

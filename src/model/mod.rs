@@ -264,6 +264,10 @@ pub enum WorkerEventKind {
     Working,
     HumanInputRequired(Notification),
     Completed,
+    /// The session ended without the human deliberately closing it — a crash, a
+    /// logout, a laptop shutdown — or was found dead by the liveness probe. The
+    /// work is unfinished, so this must never advance the card.
+    Interrupted,
     Failed,
 }
 
@@ -282,6 +286,7 @@ pub enum Phase {
     WaitingHuman,
     Idle,
     Completed,
+    Interrupted,
     Failed,
 }
 
@@ -304,7 +309,7 @@ pub struct WorkerEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum RawEventType { Started, Working, HumanInputRequired, Completed, Failed }
+enum RawEventType { Started, Working, HumanInputRequired, Completed, Interrupted, Failed }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -339,6 +344,7 @@ impl TryFrom<RawWorkerEvent> for WorkerEvent {
             (T::Started, None) => WorkerEventKind::Started,
             (T::Working, None) => WorkerEventKind::Working,
             (T::Completed, None) => WorkerEventKind::Completed,
+            (T::Interrupted, None) => WorkerEventKind::Interrupted,
             (T::Failed, None) => WorkerEventKind::Failed,
         };
         Ok(WorkerEvent { kind, source: r.source, observed_at: r.observed_at, payload_ref: r.payload_ref })
@@ -352,6 +358,7 @@ impl From<WorkerEvent> for RawWorkerEvent {
             WorkerEventKind::Working => (RawEventType::Working, None),
             WorkerEventKind::HumanInputRequired(n) => (RawEventType::HumanInputRequired, Some(n)),
             WorkerEventKind::Completed => (RawEventType::Completed, None),
+            WorkerEventKind::Interrupted => (RawEventType::Interrupted, None),
             WorkerEventKind::Failed => (RawEventType::Failed, None),
         };
         RawWorkerEvent { event_type, source: e.source, notification_type, observed_at: e.observed_at, payload_ref: e.payload_ref }

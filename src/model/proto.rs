@@ -26,6 +26,9 @@ pub enum Intent {
     ReorderCard { task: TaskId, position: usize },
     ArchiveTask { task: TaskId },
     Handoff { task: TaskId, worker: String },
+    /// Relaunch an interrupted worker, continuing its own transcript. Operator-
+    /// triggered recovery after a crash or shutdown killed the agent.
+    ResumeSession { task: TaskId },
     SetProfile { task: TaskId, profile: String },
 }
 
@@ -97,6 +100,15 @@ mod tests {
         let i = Intent::Handoff { task: TaskId::new(1), worker: "claude".into() };
         let back: Intent = serde_json::from_str(&serde_json::to_string(&i).unwrap()).unwrap();
         assert_eq!(i, back);
+    }
+
+    #[test]
+    fn resume_session_intent_round_trips() {
+        let i = Intent::ResumeSession { task: TaskId::new(1) };
+        let j = serde_json::to_string(&i).unwrap();
+        let back: Intent = serde_json::from_str(&j).unwrap();
+        assert_eq!(i, back);
+        assert!(j.contains("\"type\":\"resumeSession\""));
     }
 
     #[test]

@@ -12,6 +12,10 @@ pub trait Launcher {
     /// Best-effort teardown of a running session. Tearing down a session that is
     /// already gone is not an error.
     fn kill(&self, session_name: &str);
+    /// Whether the named terminal session is currently running. The controller
+    /// never owns the worker process, so this probe is the only way to tell a
+    /// live agent from one the machine killed underneath us.
+    fn is_alive(&self, session_name: &str) -> bool;
 }
 
 /// Real launcher: starts a detached tmux session running the worker command.
@@ -38,6 +42,20 @@ impl Launcher for TmuxLauncher {
             .arg("-t")
             .arg(session_name)
             .status();
+    }
+
+    fn is_alive(&self, session_name: &str) -> bool {
+        // `has-session` exits non-zero for an unknown session. A tmux that fails
+        // to run at all (not installed, no server) also lands here as "not
+        // alive", which is the truthful answer: nothing is running.
+        std::process::Command::new("tmux")
+            .arg("has-session")
+            .arg("-t")
+            .arg(format!("={session_name}")) // exact match, not a prefix
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
     }
 }
 
@@ -528,6 +546,7 @@ mod tests {
             Ok(())
         }
         fn kill(&self, _session_name: &str) {}
+        fn is_alive(&self, _session_name: &str) -> bool { true }
     }
 
     #[test]

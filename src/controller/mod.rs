@@ -6,3 +6,4 @@ pub mod handoff;
 pub mod events;
 pub mod activity;
 pub mod recover;
+pub mod workspace;

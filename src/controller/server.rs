@@ -1,6 +1,7 @@
 // http server — Task 5
 
 use crate::controller::apply::apply;
+use crate::controller::workspace::Workspace;
 use crate::controller::{events, handoff, store};
 use crate::model::proto::{Intent, Response, WakeRequest};
 use crate::model::TaskId;
@@ -8,7 +9,6 @@ use axum::response::sse::{Event, Sse};
 use axum::routing::get;
 use axum::{extract::State, routing::post, Json, Router};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -71,16 +71,16 @@ pub async fn poke(addr: &str, id: TaskId) -> anyhow::Result<()> {
 
 #[derive(Clone)]
 struct AppState {
-    root: Arc<PathBuf>,
+    ws: Workspace,
     changes: broadcast::Sender<()>,
 }
 
-pub fn router(root: PathBuf, changes: broadcast::Sender<()>) -> Router {
+pub fn router(ws: Workspace, changes: broadcast::Sender<()>) -> Router {
     Router::new()
         .route("/v1/intent", post(handle_intent))
         .route("/v1/wake", post(handle_wake))
         .route("/v1/events", get(sse_events))
-        .with_state(AppState { root: Arc::new(root), changes })
+        .with_state(AppState { ws, changes })
 }
 
 /// Doorbell handler: re-read one session's state, move its card to match, and
@@ -92,18 +92,23 @@ pub fn router(root: PathBuf, changes: broadcast::Sender<()>) -> Router {
 /// So we always broadcast, even when the card stays put (e.g. working -> idle both
 /// live in `doing`); otherwise the UI's spinner/warning would go stale.
 async fn handle_wake(State(state): State<AppState>, Json(wake): Json<WakeRequest>) -> Json<Response> {
-    let root = (*state.root).clone();
+    let ws = state.ws.clone();
     let task = wake.task;
-    let _ = tokio::task::spawn_blocking(move || events::ingest_session(&root, task)).await;
+    let _ = tokio::task::spawn_blocking(move || ws.write(|r| events::ingest_session(r, task))).await;
     let _ = state.changes.send(()); // ignore "no subscribers"
     Json(Response::Ok { task: Some(task) })
 }
 
 async fn handle_intent(State(state): State<AppState>, Json(intent): Json<Intent>) -> Json<Response> {
     let is_mutation = !matches!(intent, Intent::GetBoard);
-    let root = (*state.root).clone();
+    let ws = state.ws.clone();
     // the store does blocking filesystem I/O; keep it off the async reactor
-    let result = tokio::task::spawn_blocking(move || apply(&root, intent)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        // A read-only intent takes the shared guard so snapshot fetches — one per
+        // change event, per connected TUI — don't queue behind each other.
+        if is_mutation { ws.write(|r| apply(r, intent)) } else { ws.read(|r| apply(r, intent)) }
+    })
+    .await;
     let resp = match result {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => Response::Error { message: e.to_string() },
@@ -141,6 +146,9 @@ pub async fn serve(root: PathBuf, addr: std::net::SocketAddr) -> anyhow::Result<
         tracing::warn!(error = %e, "startup liveness sweep failed");
     }
 
+    // From here on every writer — request handlers and both background sweeps —
+    // shares this one handle, so their read-modify-writes can't interleave.
+    let ws = Workspace::new(root.clone());
     let (tx, _rx) = broadcast::channel(64);
     // Periodic reconcile: re-read every session's state, move cards to match, and
     // broadcast whenever the observable state (board layout OR any session's phase)
@@ -148,17 +156,19 @@ pub async fn serve(root: PathBuf, addr: std::net::SocketAddr) -> anyhow::Result<
     // changes (e.g. working -> idle, both in `doing`) and needs no working poke, so
     // the UI stays live even if a hook's doorbell never arrives.
     {
-        let root = root.clone();
+        let ws = ws.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
             let mut last_fp: Option<u64> = None;
             loop {
                 tick.tick().await;
-                let r = root.clone();
+                let ws = ws.clone();
                 let fp = tokio::task::spawn_blocking(move || {
-                    let _ = crate::controller::events::reconcile_all(&r); // apply any column moves
-                    crate::controller::events::observable_fingerprint(&r)
+                    ws.write(|r| {
+                        let _ = crate::controller::events::reconcile_all(r); // apply any column moves
+                        crate::controller::events::observable_fingerprint(r)
+                    })
                 })
                 .await;
                 if let Ok(Ok(fp)) = fp {
@@ -174,16 +184,16 @@ pub async fn serve(root: PathBuf, addr: std::net::SocketAddr) -> anyhow::Result<
     // SessionEnd hook ever firing. Broadcasts only when it actually marked
     // something, so a quiet sweep costs the UI nothing.
     {
-        let root = root.clone();
+        let ws = ws.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(LIVENESS_INTERVAL);
             tick.tick().await; // the immediate first tick is the startup sweep we just ran
             loop {
                 tick.tick().await;
-                let r = root.clone();
+                let ws = ws.clone();
                 let changed = tokio::task::spawn_blocking(move || {
-                    crate::controller::recover::reconcile_liveness(&r, &handoff::TmuxLauncher)
+                    ws.write(|r| crate::controller::recover::reconcile_liveness(r, &handoff::TmuxLauncher))
                 })
                 .await;
                 match changed {
@@ -200,7 +210,7 @@ pub async fn serve(root: PathBuf, addr: std::net::SocketAddr) -> anyhow::Result<
     // Publish where we're listening so hook processes can poke us.
     write_daemon_addr(&root, bound)?;
     tracing::info!(addr = %bound, "controller listening");
-    axum::serve(listener, router(root, tx)).await?;
+    axum::serve(listener, router(ws, tx)).await?;
     Ok(())
 }
 
@@ -237,7 +247,7 @@ mod tests {
         crate::controller::store::init_workspace(&root).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = router(root.clone(), tokio::sync::broadcast::channel(64).0);
+        let app = router(Workspace::new(root.clone()), tokio::sync::broadcast::channel(64).0);
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
 
         let client = reqwest::Client::new();
@@ -277,7 +287,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_root = root.clone();
-        tokio::spawn(async move { axum::serve(listener, router(server_root, tokio::sync::broadcast::channel(64).0)).await.unwrap(); });
+        tokio::spawn(async move { axum::serve(listener, router(Workspace::new(server_root), tokio::sync::broadcast::channel(64).0)).await.unwrap(); });
         let mut es = reqwest_eventsource::EventSource::get(format!("http://{addr}/v1/events"));
         loop { if let reqwest_eventsource::Event::Open = es.next().await.unwrap().unwrap() { break; } }
 
@@ -308,7 +318,7 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, router(root, tokio::sync::broadcast::channel(64).0)).await.unwrap(); });
+        tokio::spawn(async move { axum::serve(listener, router(Workspace::new(root), tokio::sync::broadcast::channel(64).0)).await.unwrap(); });
 
         let mut es = reqwest_eventsource::EventSource::get(format!("http://{addr}/v1/events"));
         loop {
@@ -335,7 +345,7 @@ mod tests {
         // bind :0 for an ephemeral port, serve in the background
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = router(root.clone(), tokio::sync::broadcast::channel(64).0);
+        let app = router(Workspace::new(root.clone()), tokio::sync::broadcast::channel(64).0);
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
 
         let client = reqwest::Client::new();
@@ -360,7 +370,7 @@ mod tests {
         crate::controller::store::init_workspace(&root).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = router(root.clone(), tokio::sync::broadcast::channel(64).0);
+        let app = router(Workspace::new(root.clone()), tokio::sync::broadcast::channel(64).0);
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
 
         let client = reqwest::Client::new();
@@ -387,7 +397,7 @@ mod tests {
         crate::controller::store::init_workspace(&root).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, router(root, tokio::sync::broadcast::channel(64).0)).await.unwrap(); });
+        tokio::spawn(async move { axum::serve(listener, router(Workspace::new(root), tokio::sync::broadcast::channel(64).0)).await.unwrap(); });
 
         let mut es = reqwest_eventsource::EventSource::get(format!("http://{addr}/v1/events"));
         // wait until the stream is open

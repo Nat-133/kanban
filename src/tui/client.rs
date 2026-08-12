@@ -56,7 +56,7 @@ mod tests {
         crate::controller::store::init_workspace(&root).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, crate::controller::server::router(root, tokio::sync::broadcast::channel(64).0)).await.unwrap(); });
+        tokio::spawn(async move { axum::serve(listener, crate::controller::server::router(crate::controller::workspace::Workspace::new(root), tokio::sync::broadcast::channel(64).0)).await.unwrap(); });
 
         let client = Client::new(format!("http://{addr}"));
         client.send(Intent::CreateTask { text: "A\n\ns".into(), column: "todo".parse().unwrap() }).await.unwrap();

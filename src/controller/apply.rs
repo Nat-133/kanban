@@ -259,10 +259,12 @@ fn archive(root: &Path, task_id: TaskId, launcher: &dyn handoff::Launcher) -> an
         Ok(t) => t,
         Err(_) => return Ok(Response::Error { message: format!("unknown task: {task_id}") }),
     };
-    // Idempotent: archiving an already-archived task is a no-op.
-    if task.status.archived {
-        return Ok(Response::Ok { task: Some(task_id) });
-    }
+    // Convergent rather than idempotent-by-early-exit: an already-flagged task is
+    // driven to the archived end state again rather than skipped. Returning here
+    // on the flag alone would strand any task whose flag was set but whose card
+    // survived — a crash between the two writes, or state from the pre-flag
+    // archive layout — with every later attempt silently answering Ok.
+    //
     // Tear down any worker: kill its terminal session and drop its runtime state
     // so the reconcile loop stops seeing it.
     if let Some(session) = store::load_session(root, task_id)? {
@@ -712,5 +714,24 @@ mod tests {
         // second call must not error and must leave the same end state
         archive(&r, id, &fake).unwrap();
         assert!(store::load_task(&r, id).unwrap().status.archived);
+    }
+
+    #[test]
+    fn archive_removes_the_card_of_an_already_flagged_task() {
+        // The flag and the card removal are separate writes, so a crash — or a
+        // concurrent board write that lost the removal — can leave a task flagged
+        // yet still on the board. Archiving again must finish the job, not
+        // shortcut on the flag and leave the card there forever.
+        let d = setup(); let r = root(&d);
+        apply(&r, Intent::CreateTask { text: "A".into(), column: col("todo") }).unwrap();
+        let id = TaskId::new(1);
+        let mut task = store::load_task(&r, id).unwrap();
+        task.status.archived = true;
+        store::save_task(&r, &task).unwrap();
+
+        assert_eq!(archive(&r, id, &FakeLauncher::default()).unwrap(), Response::Ok { task: Some(id) });
+
+        let board = store::load_board(&r).unwrap();
+        assert!(board.cards().values().all(|v| v.is_empty()), "card must be gone: {board:?}");
     }
 }

@@ -216,8 +216,8 @@ pub fn render(f: &mut Frame, app: &App, term_screen: Option<&tui_term::vt100::Sc
             if let Some(screen) = term_screen {
                 let title = app
                     .selected_task()
-                    .and_then(|t| app.session_for(t))
-                    .map(|s| s.session_name.clone())
+                    .and_then(|t| app.session_for(t).map(|s| (t, s.session_name.clone())))
+                    .map(|(task, session_name)| terminal_popup_title(app, task, &session_name))
                     .unwrap_or_else(|| "terminal".to_string());
                 crate::tui::term::render_terminal_popup(f, f.area(), screen, &title);
             }
@@ -239,13 +239,25 @@ fn has_jira(app: &App, task: TaskId) -> bool {
 
 /// Look up a card's display title from the snapshot, falling back to the id.
 fn card_title(app: &App, task: TaskId) -> String {
+    task_title(app, task).unwrap_or_else(|| task.to_string())
+}
+
+fn task_title(app: &App, task: TaskId) -> Option<String> {
     let name = task.to_string();
     app.snapshot()
         .tasks
         .iter()
         .find(|t| t.metadata.name == name)
         .map(|t| t.spec.title.clone())
-        .unwrap_or(name)
+}
+
+/// The popup border identifies the agent for a human, so it leads with the task's
+/// title; the tmux session name is only a fallback for a task the snapshot lost.
+fn terminal_popup_title(app: &App, task: TaskId, session_name: &str) -> String {
+    match task_title(app, task) {
+        Some(title) => format!("{task}: {title}"),
+        None => session_name.to_string(),
+    }
 }
 
 /// A `Rect` of the given width (as a percentage) and absolute height, centered
@@ -442,6 +454,16 @@ mod tests {
         terminal.draw(|f| render(f, &app, Some(parser.screen()))).unwrap();
         let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("live-shell-output"), "should render live PTY screen contents");
-        assert!(text.contains("kanban-task-0001"), "popup title should show the session name");
+        assert!(text.contains("task-0001: Buy milk"), "popup title should show the task title");
+    }
+
+    #[test]
+    fn terminal_popup_title_falls_back_to_session_name_for_an_unknown_task() {
+        use crate::model::TaskId;
+        let app = App::new(snap());
+        assert_eq!(
+            terminal_popup_title(&app, TaskId::new(99), "kanban-task-0099"),
+            "kanban-task-0099"
+        );
     }
 }

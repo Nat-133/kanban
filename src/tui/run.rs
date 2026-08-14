@@ -154,13 +154,6 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                             match app.on_key(key) {
                                 Action::Quit => break,
                                 Action::Send(intent) => {
-                                    // A handoff pops the operator straight into the
-                                    // new session's terminal to drive scoping; note
-                                    // its task before the intent is moved into send.
-                                    let handoff_task = match &intent {
-                                        crate::model::proto::Intent::Handoff { task, .. } => Some(*task),
-                                        _ => None,
-                                    };
                                     // A create leaves the cursor on the new card,
                                     // so it can be handed off or edited straight
                                     // away; the id comes back in the reply.
@@ -177,16 +170,6 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                                             refresh(&client, &mut app).await;
                                             if let (true, Some(t)) = (created, task) {
                                                 app.select_task(t);
-                                            }
-                                            // Auto-open the freshly launched session's
-                                            // terminal (the refresh above populated its
-                                            // tmux name).
-                                            if let Some(name) = handoff_task
-                                                .and_then(|t| app.session_for(t))
-                                                .map(|s| s.session_name.clone())
-                                                .filter(|n| !n.is_empty())
-                                            {
-                                                open_terminal_popup(&name, terminal, &mut term, &mut app, &redraw_tx);
                                             }
                                         }
                                         Ok(Response::Conflict { current }) => {
@@ -292,7 +275,7 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
 
 /// Attach the embedded terminal popup to the named tmux session, sizing the PTY
 /// to the current viewport. Surfaces attach failures to the status line. Shared
-/// by the `t` key (Action::OpenTerminal) and the auto-open after a handoff.
+/// by the `t` key (Action::OpenTerminal) and the open after a resume.
 fn open_terminal_popup(
     name: &str,
     terminal: &Term,

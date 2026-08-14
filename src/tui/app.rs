@@ -209,6 +209,20 @@ impl App {
         self.visible_cards(self.col).get(self.row).copied()
     }
 
+    /// Move the cursor onto `task`, wherever it sits on the board. Used after a
+    /// create so the new card is selected and `c` hands it off without any
+    /// navigation. A no-op when the active filter hides the card — silently
+    /// dropping the filter would be more surprising than leaving the cursor put.
+    pub fn select_task(&mut self, task: TaskId) {
+        for col in 0..self.columns().len() {
+            if let Some(row) = self.visible_cards(col).iter().position(|t| *t == task) {
+                self.col = col;
+                self.row = row;
+                return;
+            }
+        }
+    }
+
     /// The currently selected task's full record, looked up from the snapshot.
     pub fn detail_task(&self) -> Option<&Task> {
         let id = self.selected_task()?;
@@ -929,6 +943,38 @@ mod tests {
     fn empty_filter_shows_all_cards() {
         let app = App::new(snap());
         assert_eq!(app.visible_cards(0), app.column_cards(0)); // no filter == all
+    }
+
+    #[test]
+    fn select_task_moves_the_cursor_onto_the_card() {
+        let mut app = App::new(snap()); // todo: task-0001, task-0002
+        app.select_task(TaskId::new(2));
+        assert_eq!(app.selected_task(), Some(TaskId::new(2)));
+    }
+
+    #[test]
+    fn select_task_finds_a_card_in_another_column() {
+        use crate::controller::{store, apply::apply};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        apply(&root, Intent::CreateTask { text: "First".into(), column: "todo".parse().unwrap() }).unwrap();
+        apply(&root, Intent::CreateTask { text: "Second".into(), column: "doing".parse().unwrap() }).unwrap();
+        let s = Snapshot { board: store::load_board(&root).unwrap(), tasks: store::load_all_tasks(&root).unwrap(), sessions: vec![], descriptions: Default::default() };
+        let mut app = App::new(s);
+        app.select_task(TaskId::new(2));
+        assert_eq!(app.selected_col(), 1);
+        assert_eq!(app.selected_task(), Some(TaskId::new(2)));
+    }
+
+    #[test]
+    fn select_task_leaves_the_cursor_alone_when_the_filter_hides_the_card() {
+        let mut app = App::new(snap());
+        app.on_key(key('/'));
+        app.on_key(key('F')); // only "First" (task-0001) is visible
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.select_task(TaskId::new(2));
+        assert_eq!(app.selected_task(), Some(TaskId::new(1)));
     }
 
     #[test]

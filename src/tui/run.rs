@@ -161,16 +161,23 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                                         crate::model::proto::Intent::Handoff { task, .. } => Some(*task),
                                         _ => None,
                                     };
+                                    // A create leaves the cursor on the new card,
+                                    // so it can be handed off or edited straight
+                                    // away; the id comes back in the reply.
+                                    let created = matches!(intent, crate::model::proto::Intent::CreateTask { .. });
                                     // Inspect the controller's reply, not just the
                                     // transport result: a `Response::Error`/`Conflict`
                                     // arrives as `Ok(resp)`, so matching on `Ok(_)`
                                     // would silently treat a rejection as success.
                                     match client.send(intent).await {
-                                        Ok(Response::Ok { .. }) => {
+                                        Ok(Response::Ok { task }) => {
                                             // A committed description edit closes its
                                             // editor; a no-op for every other intent.
                                             app.close_editor();
                                             refresh(&client, &mut app).await;
+                                            if let (true, Some(t)) = (created, task) {
+                                                app.select_task(t);
+                                            }
                                             // Auto-open the freshly launched session's
                                             // terminal (the refresh above populated its
                                             // tmux name).

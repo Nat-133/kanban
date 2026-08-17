@@ -191,6 +191,16 @@ impl App {
         self.snapshot().sessions.iter().find(|s| s.task == task)
     }
 
+    /// The task a terminal session belongs to. The popup only knows the terminal
+    /// session name, so acting on the task behind it needs this reverse lookup.
+    pub fn task_for_session(&self, session_name: &str) -> Option<TaskId> {
+        self.snapshot()
+            .sessions
+            .iter()
+            .find(|s| s.session_name == session_name)
+            .map(|s| s.task)
+    }
+
     /// The current filter text (active when in `Search` mode or non-empty).
     pub fn filter(&self) -> &str {
         &self.filter

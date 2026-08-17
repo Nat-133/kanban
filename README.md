@@ -83,3 +83,9 @@ calls it to record a worker event and ring the daemon's doorbell.
 The TUI is vim-keyed: `h/l` and `j/k` to move, `H/L` and `J/K` to move and reorder cards,
 `enter` to open, `a`/`e`/`d` to add, edit and archive, `c` to hand off to a worker, `t` to
 attach to its terminal, `/` to search, `?` for help.
+
+Inside the terminal popup, `Ctrl+G` prefixes the popup's own commands: `q` closes it, `T`
+re-attaches full-screen, and `r` re-hands the task off — the terminal is killed and the agent
+relaunched with regenerated hooks, handoff and allowlist, `--resume`d onto the same
+conversation. That is the only way a change to what a session is given reaches a running
+agent, since Claude reads `--settings` once at launch.

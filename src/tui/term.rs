@@ -172,7 +172,7 @@ pub fn render_terminal_popup(f: &mut Frame, area: Rect, screen: &tui_term::vt100
     let popup = centered_rect_pct(90, 90, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {title} — Ctrl+G q to close "));
+        .title(format!(" {title} — Ctrl+G q to close, Ctrl+G r to re-hand off "));
     let term = PseudoTerminal::new(screen).block(block);
     f.render_widget(Clear, popup);
     f.render_widget(term, popup);
@@ -187,6 +187,9 @@ pub enum TermAction {
     Close,
     /// Detach the popup and re-attach full-screen (the fallback path).
     Fullscreen,
+    /// Hand the task off again into the same conversation (fresh hooks and
+    /// handoff, `--resume`d transcript), then re-attach.
+    Rehandoff,
     /// Swallow the key (e.g. it just armed the prefix, or was unrecognised).
     None,
 }
@@ -227,6 +230,7 @@ pub fn handle_prefixed_key(armed: bool, key: KeyEvent) -> (bool, TermAction) {
             KeyCode::Char('g') if ctrl => (false, TermAction::Forward(vec![0x07])),
             KeyCode::Char('q') | KeyCode::Esc => (false, TermAction::Close),
             KeyCode::Char('T') => (false, TermAction::Fullscreen),
+            KeyCode::Char('r') => (false, TermAction::Rehandoff),
             // Unrecognised command: disarm and swallow.
             _ => (false, TermAction::None),
         }
@@ -421,6 +425,16 @@ mod tests {
             encode_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
             Some(b"\x1b[A".to_vec())
         );
+    }
+
+    #[test]
+    fn prefixed_r_asks_for_a_rehandoff() {
+        assert_eq!(handle_prefixed_key(true, key('r')), (false, TermAction::Rehandoff));
+    }
+
+    #[test]
+    fn an_unprefixed_r_still_types_into_the_session() {
+        assert_eq!(handle_prefixed_key(false, key('r')), (false, TermAction::Forward(vec![b'r'])));
     }
 
     #[test]

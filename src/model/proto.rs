@@ -29,6 +29,11 @@ pub enum Intent {
     /// Relaunch an interrupted worker, continuing its own transcript. Operator-
     /// triggered recovery after a crash or shutdown killed the agent.
     ResumeSession { task: TaskId },
+    /// Tear the worker's terminal down and hand the task off again from scratch —
+    /// fresh hook settings, handoff and launch command — while continuing the
+    /// agent's own transcript. How a change to what a session is given (new hooks,
+    /// a widened allowlist) reaches an agent that is mid-conversation.
+    Rehandoff { task: TaskId },
     SetProfile { task: TaskId, profile: String },
 }
 

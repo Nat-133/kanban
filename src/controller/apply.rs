@@ -53,6 +53,7 @@ pub fn apply(root: &Path, intent: Intent) -> anyhow::Result<Response> {
         Intent::ReorderCard { task, position } => reorder_card(root, task, position),
         Intent::ArchiveTask { task } => archive(root, task, &handoff::TmuxLauncher),
         Intent::ResumeSession { task } => resume(root, task, &handoff::TmuxLauncher),
+        Intent::Rehandoff { task } => rehandoff(root, task, &handoff::TmuxLauncher),
         Intent::SetProfile { task, profile } => set_profile(root, task, profile),
         Intent::Handoff { task, worker } => {
             match handoff::handoff(root, task, &worker, &handoff::TmuxLauncher) {
@@ -197,6 +198,76 @@ fn reorder_card(root: &Path, task_id: TaskId, position: usize) -> anyhow::Result
     Ok(Response::Ok { task: Some(task_id) })
 }
 
+/// Point a launch command at an existing Claude transcript.
+///
+/// A previous relaunch may have left a `--resume` behind; overwrite its value
+/// rather than skipping, because the relaunched agent reports its own session id,
+/// so the recorded one is the live transcript and the old one is stale.
+/// `get_mut` rather than indexing: a hand-edited session.yaml could leave a
+/// trailing `--resume` with no value, and that must not panic the daemon.
+fn continue_transcript(command: &mut Vec<String>, session_id: String) {
+    match command.iter().position(|a| a == "--resume") {
+        Some(at) => match command.get_mut(at + 1) {
+            Some(slot) => *slot = session_id,
+            None => command.push(session_id),
+        },
+        // Right after the worker binary: the trailing positional prompt must stay
+        // non-leading, and the variadic `--add-dir` must stay last.
+        None => {
+            command.insert(1, session_id);
+            command.insert(1, "--resume".to_string());
+        }
+    }
+}
+
+/// Hand the task off again into the same conversation: tear the terminal down,
+/// regenerate everything a handoff generates (hook settings, handoff.md, the
+/// launch command, the context symlinks), then relaunch with `--resume` so the
+/// agent keeps its history.
+///
+/// This is the only way a change to what a session is *given* — new hooks, a
+/// widened allowlist, edited context — reaches an agent that is mid-conversation,
+/// since Claude reads `--settings` once at launch. Unlike `resume` it does not
+/// refuse a live session: killing the terminal is the point.
+fn rehandoff(root: &Path, task_id: TaskId, launcher: &dyn handoff::Launcher) -> anyhow::Result<Response> {
+    let Some(old) = store::load_session(root, task_id)? else {
+        return Ok(Response::Error { message: format!("no worker session for {task_id}") });
+    };
+    let cfg = store::load_config(root)?;
+    let worker_name = old.spec.worker.clone();
+    let Some(worker) = cfg.workers.get(&worker_name) else {
+        return Ok(Response::Error { message: format!("unknown worker: {worker_name}") });
+    };
+    let mut task = store::load_task(root, task_id)?;
+    let context = cfg.context_for(task.spec.profile.as_deref());
+    if let Some(name) = old.spec.session_name.as_deref() {
+        launcher.kill(name);
+    }
+    let mut session =
+        handoff::prepare_session(root, &task, &worker_name, worker, &cfg.agents.base_dirs, &context)?;
+    // Carry the recorded transcript across: the freshly prepared session starts
+    // with an empty status, and losing the session id would silently downgrade
+    // the rehandoff into a from-scratch handoff.
+    session.status = old.status.clone();
+    if let Some(sid) = session.status.session_id.clone() {
+        continue_transcript(&mut session.spec.command, sid);
+    }
+    let session_name = session.spec.session_name.clone().unwrap_or_default();
+    launcher.launch(&session, &session_name)?;
+    store::save_session(root, &session)?;
+    task.status.worker_session_ref = Some(session.metadata.name.clone());
+    store::save_task(root, &task)?;
+    let event = WorkerEvent {
+        kind: WorkerEventKind::Started,
+        source: "rehandoff".to_string(),
+        observed_at: time::OffsetDateTime::now_utc(),
+        payload_ref: None,
+    };
+    store::save_state(root, task_id, &event)?;
+    crate::controller::events::ingest_session(root, task_id)?;
+    Ok(Response::Ok { task: Some(task_id) })
+}
+
 /// Relaunch a worker whose terminal session is gone, continuing its own
 /// transcript where one was captured.
 ///
@@ -219,24 +290,7 @@ fn resume(root: &Path, task_id: TaskId, launcher: &dyn handoff::Launcher) -> any
     // starts fresh from the handoff rather than refusing to come back at all.
     let mut command = session.spec.command.clone();
     if let Some(sid) = session.status.session_id.clone() {
-        match command.iter().position(|a| a == "--resume") {
-            // A previous resume left a flag behind. Overwrite its value rather
-            // than skipping: the relaunched agent reports its own session id, so
-            // the recorded one is the live transcript and the old one is stale.
-            // `get_mut` rather than indexing: a hand-edited session.yaml could
-            // leave a trailing `--resume` with no value, and that must not panic
-            // the daemon.
-            Some(at) => match command.get_mut(at + 1) {
-                Some(slot) => *slot = sid,
-                None => command.push(sid),
-            },
-            // Right after the worker binary: the trailing positional prompt must
-            // stay non-leading, and the variadic `--add-dir` must stay last.
-            None => {
-                command.insert(1, sid);
-                command.insert(1, "--resume".to_string());
-            }
-        }
+        continue_transcript(&mut command, sid);
     }
     session.spec.command = command;
     launcher.launch(&session, &session_name)?;
@@ -673,6 +727,92 @@ mod tests {
         // NoLaunch reports every session alive.
         match resume(&r, id, &NoLaunch).unwrap() {
             Response::Error { message } => assert!(message.contains("still running"), "{message}"),
+            o => panic!("expected an error, got {o:?}"),
+        }
+    }
+
+    /// Live sessions (like tmux really is when the popup is open), recording both
+    /// what it killed and what it launched.
+    #[derive(Default)]
+    struct LiveLauncher {
+        killed: std::sync::Mutex<Vec<String>>,
+        launched: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+    impl handoff::Launcher for LiveLauncher {
+        fn launch(&self, session: &WorkerSession, _n: &str) -> anyhow::Result<()> {
+            self.launched.lock().unwrap().push(session.spec.command.clone());
+            Ok(())
+        }
+        fn kill(&self, n: &str) { self.killed.lock().unwrap().push(n.to_string()); }
+        fn is_alive(&self, _n: &str) -> bool { true }
+    }
+
+    /// Hand off task 1 and let it report a session id: a live, mid-conversation agent.
+    fn live_task(r: &Path) -> TaskId {
+        apply(r, Intent::CreateTask { text: "A".into(), column: col("todo") }).unwrap();
+        let id = TaskId::new(1);
+        handoff::handoff(r, id, "claude", &NoLaunch).unwrap();
+        crate::controller::events::record_state(r, id, "session-start", "{\"session_id\":\"abc-123\"}").unwrap();
+        id
+    }
+
+    #[test]
+    fn rehandoff_kills_the_live_session_and_relaunches_the_same_transcript() {
+        let d = setup(); let r = root(&d);
+        let id = live_task(&r);
+        let launcher = LiveLauncher::default();
+
+        let resp = rehandoff(&r, id, &launcher).unwrap();
+
+        assert_eq!(resp, Response::Ok { task: Some(id) });
+        assert_eq!(launcher.killed.lock().unwrap().len(), 1, "the old terminal is torn down");
+        let cmds = launcher.launched.lock().unwrap();
+        let at = cmds[0].iter().position(|a| a == "--resume").expect("resume flag");
+        assert_eq!(cmds[0][at + 1], "abc-123", "same conversation");
+        assert_eq!(crate::controller::events::session_phase(&r, id).unwrap(), Phase::Working);
+    }
+
+    #[test]
+    fn rehandoff_regenerates_the_hook_settings() {
+        let d = setup(); let r = root(&d);
+        let id = live_task(&r);
+        let settings = store::session_dir(&r, id).join("hooks/settings.json");
+        std::fs::write(&settings, "{}").unwrap(); // a session launched by an older build
+
+        rehandoff(&r, id, &LiveLauncher::default()).unwrap();
+
+        let text = std::fs::read_to_string(&settings).unwrap();
+        assert!(text.contains("SubagentStop"), "settings must be rewritten: {text}");
+    }
+
+    #[test]
+    fn rehandoff_keeps_the_recorded_session_id_on_disk() {
+        // The prepared session starts with an empty status; dropping the id here
+        // would turn every later resume into a from-scratch handoff.
+        let d = setup(); let r = root(&d);
+        let id = live_task(&r);
+        rehandoff(&r, id, &LiveLauncher::default()).unwrap();
+        let session = store::load_session(&r, id).unwrap().unwrap();
+        assert_eq!(session.status.session_id.as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn rehandoff_does_not_stack_resume_flags_when_run_twice() {
+        let d = setup(); let r = root(&d);
+        let id = live_task(&r);
+        let launcher = LiveLauncher::default();
+        rehandoff(&r, id, &launcher).unwrap();
+        rehandoff(&r, id, &launcher).unwrap();
+        let cmds = launcher.launched.lock().unwrap();
+        assert_eq!(cmds[1].iter().filter(|a| *a == "--resume").count(), 1);
+    }
+
+    #[test]
+    fn rehandoff_without_a_session_errors() {
+        let d = setup(); let r = root(&d);
+        apply(&r, Intent::CreateTask { text: "A".into(), column: col("todo") }).unwrap();
+        match rehandoff(&r, TaskId::new(1), &LiveLauncher::default()).unwrap() {
+            Response::Error { message } => assert!(message.contains("no worker session"), "{message}"),
             o => panic!("expected an error, got {o:?}"),
         }
     }

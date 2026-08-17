@@ -64,6 +64,8 @@ enum Post {
     Nothing,
     Close,
     Fullscreen(String),
+    /// Re-hand off the task behind the popup's session, then re-attach.
+    Rehandoff(String),
 }
 
 async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
@@ -127,6 +129,7 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                                     TermAction::None => Post::Nothing,
                                     TermAction::Close => Post::Close,
                                     TermAction::Fullscreen => Post::Fullscreen(t.name().to_string()),
+                                    TermAction::Rehandoff => Post::Rehandoff(t.name().to_string()),
                                 }
                             } else {
                                 Post::Nothing
@@ -138,6 +141,38 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                                     set_mouse_capture(false);
                                     app.exit_terminal();
                                     refresh(&client, &mut app).await;
+                                }
+                                // Killing the terminal is what a re-handoff does,
+                                // so drop the popup first: its PTY is attached to
+                                // the session about to die.
+                                Post::Rehandoff(name) => {
+                                    term = None;
+                                    set_mouse_capture(false);
+                                    app.exit_terminal();
+                                    match app.task_for_session(&name) {
+                                        Some(task) => {
+                                            match client.send(crate::model::proto::Intent::Rehandoff { task }).await {
+                                                Ok(Response::Ok { .. }) => {
+                                                    refresh(&client, &mut app).await;
+                                                    app.status = Some(format!("re-handed off {task}"));
+                                                    // The name is recomputed from
+                                                    // config, so re-read it rather
+                                                    // than reusing the dead one.
+                                                    let name = app
+                                                        .session_for(task)
+                                                        .map(|s| s.session_name.clone())
+                                                        .filter(|n| !n.is_empty());
+                                                    if let Some(name) = name {
+                                                        open_terminal_popup(&name, terminal, &mut term, &mut app, &redraw_tx);
+                                                    }
+                                                }
+                                                Ok(Response::Error { message }) => app.status = Some(message),
+                                                Ok(_) => refresh(&client, &mut app).await,
+                                                Err(e) => app.status = Some(e.to_string()),
+                                            }
+                                        }
+                                        None => app.status = Some(format!("no task owns session {name}")),
+                                    }
                                 }
                                 Post::Fullscreen(name) => {
                                     // Close the popup and repaint the board once,

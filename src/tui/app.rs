@@ -54,8 +54,19 @@ pub enum Mode {
 /// input mode, and any in-progress text input. No terminal or I/O.
 pub struct App {
     snapshot: Snapshot,
-    col: usize,
-    row: usize,
+    /// The cursor. A selection is a *task*, not a slot, so a card stays selected
+    /// wherever the board moves it — including the move the operator just asked
+    /// for with `H`/`L`/`K`/`J`, which lands only when the snapshot comes back.
+    selected: Option<TaskId>,
+    /// Historical, never truth: where the cursor last resolved to. Read only when
+    /// `selected` can't be found in the current snapshot — an empty column, or a
+    /// card the filter hides or archiving removed. Every live answer re-derives
+    /// from `selected` instead; see `selected_col`/`selected_row`.
+    last_col: usize,
+    /// Historical, and the sticky row *intent*: only `j`/`k` rewrite it, so
+    /// hopping through a short column and back doesn't erode the row the operator
+    /// asked for. The row actually on screen is `selected_row`.
+    last_row: usize,
     mode: Mode,
     filter: String,
     editing: Option<TaskId>,
@@ -73,10 +84,11 @@ pub struct App {
 
 impl App {
     pub fn new(snapshot: Snapshot) -> Self {
-        Self {
+        let mut app = Self {
             snapshot,
-            col: 0,
-            row: 0,
+            selected: None,
+            last_col: 0,
+            last_row: 0,
             mode: Mode::Normal,
             filter: String::new(),
             editing: None,
@@ -84,7 +96,9 @@ impl App {
             desc_base: None,
             status: None,
             tick: 0,
-        }
+        };
+        app.sync();
+        app
     }
 
     /// The current spinner tick; the renderer indexes its frame table with this.
@@ -113,7 +127,7 @@ impl App {
 
     pub fn set_snapshot(&mut self, s: Snapshot) {
         self.snapshot = s;
-        self.clamp();
+        self.sync();
     }
 
     pub fn mode(&self) -> &Mode {
@@ -132,12 +146,30 @@ impl App {
         self.editor.as_ref().map(|e| e.lines().join("\n"))
     }
 
+    /// Where the selected task currently sits, or `None` when it isn't on the
+    /// visible board. The single derivation everything else about the cursor is
+    /// built from.
+    fn resolved(&self) -> Option<(usize, usize)> {
+        let task = self.selected?;
+        (0..self.columns().len())
+            .find_map(|col| self.visible_cards(col).iter().position(|t| *t == task).map(|row| (col, row)))
+    }
+
     pub fn selected_col(&self) -> usize {
-        self.col
+        match self.resolved() {
+            Some((col, _)) => col,
+            None => self.last_col.min(self.columns().len().saturating_sub(1)),
+        }
     }
 
     pub fn selected_row(&self) -> usize {
-        self.row
+        match self.resolved() {
+            Some((_, row)) => row,
+            None => {
+                let n = self.visible_cards(self.selected_col()).len();
+                if n == 0 { 0 } else { self.last_row.min(n - 1) }
+            }
+        }
     }
 
     pub fn columns(&self) -> &[Column] {
@@ -206,7 +238,7 @@ impl App {
     }
 
     pub fn selected_task(&self) -> Option<TaskId> {
-        self.visible_cards(self.col).get(self.row).copied()
+        self.resolved().and(self.selected)
     }
 
     /// Move the cursor onto `task`, wherever it sits on the board. Used after a
@@ -216,8 +248,9 @@ impl App {
     pub fn select_task(&mut self, task: TaskId) {
         for col in 0..self.columns().len() {
             if let Some(row) = self.visible_cards(col).iter().position(|t| *t == task) {
-                self.col = col;
-                self.row = row;
+                self.selected = Some(task);
+                self.last_col = col;
+                self.last_row = row;
                 return;
             }
         }
@@ -251,16 +284,25 @@ impl App {
         if fullscreen { Action::AttachFullscreen(name) } else { Action::OpenTerminal(name) }
     }
 
-    fn clamp(&mut self) {
-        let ncols = self.columns().len();
-        if ncols == 0 {
-            self.col = 0;
-            self.row = 0;
+    /// Refresh the history fields after the board or the filter changed, and
+    /// re-home the cursor when the selected task is no longer visible — archived,
+    /// filtered out, or never set. A column the cursor sits on with nothing
+    /// highlighted is dead space, so any card that appears there is adopted.
+    fn sync(&mut self) {
+        if let Some((col, _)) = self.resolved() {
+            self.last_col = col;
             return;
         }
-        self.col = self.col.min(ncols - 1);
-        let n = self.visible_cards(self.col).len();
-        self.row = if n == 0 { 0 } else { self.row.min(n - 1) };
+        self.park_on(self.selected_col());
+    }
+
+    /// Put the cursor in `col`, selecting the card at the remembered row intent.
+    /// An empty column leaves nothing selected: there is no id to hold, so the
+    /// cursor points at the column itself and `a` still creates into it.
+    fn park_on(&mut self, col: usize) {
+        self.last_col = col;
+        let cards = self.visible_cards(col);
+        self.selected = cards.get(self.last_row.min(cards.len().saturating_sub(1))).copied();
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
@@ -364,30 +406,19 @@ impl App {
         match key.code {
             KeyCode::Char('q') => Action::Quit,
             KeyCode::Char('h') => {
-                if self.col > 0 {
-                    self.col -= 1;
-                }
-                self.clamp();
+                self.step_col(-1);
                 Action::None
             }
             KeyCode::Char('l') => {
-                if self.col + 1 < self.columns().len() {
-                    self.col += 1;
-                }
-                self.clamp();
+                self.step_col(1);
                 Action::None
             }
             KeyCode::Char('j') => {
-                let n = self.visible_cards(self.col).len();
-                if n > 0 && self.row + 1 < n {
-                    self.row += 1;
-                }
+                self.step_row(1);
                 Action::None
             }
             KeyCode::Char('k') => {
-                if self.row > 0 {
-                    self.row -= 1;
-                }
+                self.step_row(-1);
                 Action::None
             }
             KeyCode::Char('H') => self.move_card(-1),
@@ -443,9 +474,30 @@ impl App {
         }
     }
 
+    /// Move the cursor one column over, landing on the card at the remembered row
+    /// intent. Deliberately leaves `last_row` alone so a hop through a short
+    /// column and back returns to the row the operator asked for.
+    fn step_col(&mut self, dir: isize) {
+        let target = self.selected_col() as isize + dir;
+        if target < 0 || target as usize >= self.columns().len() {
+            return;
+        }
+        self.park_on(target as usize);
+    }
+
+    fn step_row(&mut self, dir: isize) {
+        let cards = self.visible_cards(self.selected_col());
+        if cards.is_empty() {
+            return;
+        }
+        let row = (self.selected_row() as isize + dir).clamp(0, cards.len() as isize - 1) as usize;
+        self.selected = Some(cards[row]);
+        self.last_row = row;
+    }
+
     fn move_card(&self, dir: isize) -> Action {
         let cols = self.column_ids();
-        let target = self.col as isize + dir;
+        let target = self.selected_col() as isize + dir;
         if target < 0 || target as usize >= cols.len() {
             return Action::None;
         }
@@ -459,17 +511,21 @@ impl App {
         }
     }
 
+    /// Swap the selected card with its neighbour. `ReorderCard` carries an index
+    /// into the whole column, but the cursor steps over *visible* cards, so the
+    /// neighbour is mapped back to its board index — otherwise an active filter
+    /// sends the card to an unrelated slot.
     fn reorder(&self, dir: isize) -> Action {
-        let new = self.row as isize + dir;
-        let n = self.visible_cards(self.col).len() as isize;
-        if new < 0 || new >= n {
+        let col = self.selected_col();
+        let visible = self.visible_cards(col);
+        let new = self.selected_row() as isize + dir;
+        if new < 0 || new >= visible.len() as isize {
             return Action::None;
         }
-        match self.selected_task() {
-            Some(task) => Action::Send(Intent::ReorderCard {
-                task,
-                position: new as usize,
-            }),
+        let Some(task) = self.selected_task() else { return Action::None };
+        let neighbour = visible[new as usize];
+        match self.column_cards(col).iter().position(|t| *t == neighbour) {
+            Some(position) => Action::Send(Intent::ReorderCard { task, position }),
             None => Action::None,
         }
     }
@@ -500,7 +556,7 @@ impl App {
     fn on_add(&mut self, key: KeyEvent) -> Action {
         if Self::is_submit(&key) {
             let text = self.editor_text().unwrap_or_default();
-            let column = self.columns()[self.col].id.clone();
+            let column = self.columns()[self.selected_col()].id.clone();
             self.close_editor();
             if text.trim().is_empty() {
                 return Action::None;
@@ -563,22 +619,22 @@ impl App {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.filter.clear();
-                self.clamp();
+                self.sync();
                 Action::None
             }
             KeyCode::Enter => {
                 self.mode = Mode::Normal;
-                self.clamp();
+                self.sync();
                 Action::None
             }
             KeyCode::Backspace => {
                 self.filter.pop();
-                self.clamp();
+                self.sync();
                 Action::None
             }
             KeyCode::Char(c) => {
                 self.filter.push(c);
-                self.clamp();
+                self.sync();
                 Action::None
             }
             _ => Action::None,
@@ -658,6 +714,139 @@ mod tests {
         app.on_key(key('l')); // move to ready (empty)
         assert!(app.selected_col() > before);
         assert_eq!(app.selected_row(), 0); // clamps in empty column
+    }
+
+    /// A live workspace: intents can be applied and a fresh snapshot taken, so a
+    /// test can play out the round trip the cursor depends on — keypress, board
+    /// write, new snapshot.
+    struct Workspace {
+        _dir: tempfile::TempDir,
+        root: std::path::PathBuf,
+    }
+
+    impl Workspace {
+        fn with_cards(titles: &[&str]) -> Workspace {
+            use crate::controller::{apply::apply, store};
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join(".kanban");
+            store::init_workspace(&root).unwrap();
+            for t in titles {
+                apply(&root, Intent::CreateTask { text: (*t).into(), column: "todo".parse().unwrap() }).unwrap();
+            }
+            Workspace { _dir: dir, root }
+        }
+
+        fn apply(&self, intent: Intent) {
+            crate::controller::apply::apply(&self.root, intent).unwrap();
+        }
+
+        fn snapshot(&self) -> Snapshot {
+            use crate::controller::store;
+            Snapshot {
+                board: store::load_board(&self.root).unwrap(),
+                tasks: store::load_all_tasks(&self.root).unwrap(),
+                sessions: vec![],
+                descriptions: Default::default(),
+            }
+        }
+
+        /// Send whatever intent the key produced back through the controller and
+        /// hand the app the resulting snapshot, as the run loop would.
+        fn round_trip(&self, app: &mut App, k: KeyEvent) {
+            if let Action::Send(intent) = app.on_key(k) {
+                self.apply(intent);
+            }
+            app.set_snapshot(self.snapshot());
+        }
+    }
+
+    fn shift(c: char) -> KeyEvent { KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT) }
+
+    #[test]
+    fn selection_follows_a_card_moved_across_columns() {
+        let ws = Workspace::with_cards(&["First", "Second"]);
+        let mut app = App::new(ws.snapshot());
+        ws.round_trip(&mut app, shift('L'));
+        assert_eq!(app.selected_task(), Some(TaskId::new(1)));
+        assert_eq!(app.selected_col(), 1); // todo -> doing
+    }
+
+    #[test]
+    fn selection_follows_a_card_reordered_within_its_column() {
+        let ws = Workspace::with_cards(&["First", "Second"]);
+        let mut app = App::new(ws.snapshot());
+        ws.round_trip(&mut app, shift('J'));
+        assert_eq!(app.selected_task(), Some(TaskId::new(1)));
+        assert_eq!(app.selected_row(), 1);
+    }
+
+    #[test]
+    fn selection_follows_a_card_moved_by_someone_else() {
+        let ws = Workspace::with_cards(&["First", "Second"]);
+        let mut app = App::new(ws.snapshot());
+        ws.apply(Intent::MoveCard {
+            task: TaskId::new(1),
+            to_column: "done".parse().unwrap(),
+            position: None,
+        });
+        app.set_snapshot(ws.snapshot());
+        assert_eq!(app.selected_task(), Some(TaskId::new(1)));
+        assert_eq!(app.selected_col(), 2);
+    }
+
+    #[test]
+    fn cursor_falls_back_to_the_remembered_row_when_the_selected_card_goes_away() {
+        let ws = Workspace::with_cards(&["First", "Second", "Third"]);
+        let mut app = App::new(ws.snapshot());
+        app.on_key(key('j'));
+        app.on_key(key('j')); // row 2: task-0003
+        ws.apply(Intent::ArchiveTask { task: TaskId::new(3) });
+        app.set_snapshot(ws.snapshot());
+        assert_eq!(app.selected_row(), 1); // clamped onto the last card
+        assert_eq!(app.selected_task(), Some(TaskId::new(2)));
+    }
+
+    #[test]
+    fn parking_on_an_empty_column_selects_a_card_that_later_appears() {
+        let ws = Workspace::with_cards(&["First"]);
+        let mut app = App::new(ws.snapshot());
+        app.on_key(key('l')); // doing is empty
+        assert_eq!(app.selected_task(), None);
+        assert_eq!(app.selected_col(), 1);
+        ws.apply(Intent::MoveCard {
+            task: TaskId::new(1),
+            to_column: "doing".parse().unwrap(),
+            position: None,
+        });
+        app.set_snapshot(ws.snapshot());
+        assert_eq!(app.selected_task(), Some(TaskId::new(1)));
+    }
+
+    #[test]
+    fn a_hop_through_a_short_column_keeps_the_row_intent() {
+        let ws = Workspace::with_cards(&["First", "Second"]);
+        let mut app = App::new(ws.snapshot());
+        app.on_key(key('j')); // row 1 in todo
+        app.on_key(key('l')); // doing is empty, so the row has nowhere to go
+        app.on_key(key('h'));
+        assert_eq!(app.selected_row(), 1);
+        assert_eq!(app.selected_task(), Some(TaskId::new(2)));
+    }
+
+    #[test]
+    fn reorder_sends_a_board_position_not_a_visible_one() {
+        let ws = Workspace::with_cards(&["keep alpha", "hidden", "keep beta"]);
+        let mut app = App::new(ws.snapshot());
+        for c in "/keep".chars() {
+            app.on_key(key(c));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // both 'keep' cards are visible; the cursor is on the first at board index
+        // 0 and its visible neighbour lives at board index 2.
+        assert_eq!(
+            app.on_key(shift('J')),
+            Action::Send(Intent::ReorderCard { task: TaskId::new(1), position: 2 })
+        );
     }
 
     #[test]

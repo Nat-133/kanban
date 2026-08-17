@@ -1,4 +1,5 @@
 use crate::controller::activity::{self, ActivityKind, InterruptionReason};
+use crate::controller::background;
 use crate::controller::store;
 use crate::model::{Notification, Phase, TaskId, WorkerEvent, WorkerEventKind};
 use serde::{Deserialize, Serialize};
@@ -16,13 +17,22 @@ pub struct IntakePayload {
 /// Map a captured hook firing to a worker event. None = not tracked (e.g. a
 /// non-permission/idle Notification like auth_success), in which case the
 /// session's state is left untouched.
-fn to_event(item: &IntakePayload) -> Option<WorkerEvent> {
+///
+/// `background_pending` is whether the session has a spawned subagent that has
+/// not reported back, which changes what a Stop means.
+fn to_event(item: &IntakePayload, background_pending: bool) -> Option<WorkerEvent> {
     let kind = match item.event.as_str() {
         "session-start" => WorkerEventKind::Started,
         "user-prompt-submit" => WorkerEventKind::Working,
         // Stop fires when claude finishes its turn and hands control back to the
         // human — it is waiting for a response, not working. Treat it as idle so
         // the card flips to the warning, not the spinner.
+        //
+        // Unless a subagent is still running: Stop also fires when claude yields
+        // the turn to wait on background work, and the agent will be re-invoked
+        // when that reports back. Nobody is waiting on the human, so the card must
+        // keep the spinner.
+        "stop" if background_pending => WorkerEventKind::Working,
         "stop" => WorkerEventKind::HumanInputRequired(Notification::IdlePrompt),
         // SessionEnd fires on ANY teardown — a deliberate exit, a `/clear`, a
         // logout, or the terminal dying under the agent at laptop shutdown. Only
@@ -58,9 +68,13 @@ fn to_event(item: &IntakePayload) -> Option<WorkerEvent> {
 /// Steers and interruptions are the observability signals we fold into
 /// context-switch metrics; everything else (session lifecycle, non-blocking
 /// notifications like auth_success) yields None.
-fn to_activity(item: &IntakePayload) -> Option<ActivityKind> {
+fn to_activity(item: &IntakePayload, background_pending: bool) -> Option<ActivityKind> {
     match item.event.as_str() {
         "user-prompt-submit" => Some(ActivityKind::Steer),
+        // A stop that only yields to a running subagent costs the human nothing, so
+        // counting it would inflate interruptions-per-task with work the agent did
+        // unattended.
+        "stop" if background_pending => None,
         "stop" => Some(ActivityKind::Interruption { reason: InterruptionReason::Idle }),
         "notification" => match item.payload.get("notification_type").and_then(|v| v.as_str()) {
             Some("permission_prompt") => {
@@ -82,10 +96,19 @@ pub fn record_state(root: &Path, id: TaskId, event: &str, raw_payload: &str) -> 
     let payload: serde_json::Value = serde_json::from_str(raw_payload)
         .unwrap_or_else(|_| serde_json::Value::String(raw_payload.to_string()));
     let item = IntakePayload { event: event.to_string(), payload };
+    // Subagent bookkeeping first, so a firing that both mutates and reads the
+    // pending set (a prompt or session start clearing it) sees its own effect.
+    match item.event.as_str() {
+        "pre-tool-use" => background::started(root, id)?,
+        "subagent-stop" => background::finished(root, id)?,
+        "user-prompt-submit" | "session-start" => background::clear(root, id)?,
+        _ => {}
+    }
+    let background_pending = background::pending(root, id);
     // Best-effort activity fact: a human-involvement firing (steer/interruption)
     // is ALSO appended to the root activity log. This must never break state
     // recording, so any failure is warned and swallowed.
-    if let Some(kind) = to_activity(&item) {
+    if let Some(kind) = to_activity(&item, background_pending) {
         let profile = store::load_task(root, id)
             .ok()
             .and_then(|t| t.spec.profile)
@@ -106,7 +129,7 @@ pub fn record_state(root: &Path, id: TaskId, event: &str, raw_payload: &str) -> 
     if let Err(e) = capture_session_metadata(root, id, &item.event, &item.payload) {
         tracing::warn!(error = %e, "failed to capture session metadata");
     }
-    match to_event(&item) {
+    match to_event(&item, background_pending) {
         Some(ev) => {
             store::save_state(root, id, &ev)?;
             Ok(true)
@@ -356,6 +379,65 @@ mod tests {
         let board = store::load_board(&root).unwrap();
         // in-progress (needs human) -> stays in doing; the warning icon shows it's waiting.
         assert!(board.cards().get(&"doing".parse().unwrap()).unwrap().contains(&id));
+    }
+
+    #[test]
+    fn stop_while_a_subagent_runs_stays_working() {
+        let (_d, root, id) = workspace_with_task();
+        record_state(&root, id, "pre-tool-use", "{}").unwrap();
+        record_state(&root, id, "stop", "{}").unwrap();
+        assert_eq!(session_phase(&root, id).unwrap(), Phase::Working);
+        assert!(!session_phase(&root, id).unwrap().needs_human_input());
+        assert!(
+            crate::controller::activity::load(&root).unwrap().is_empty(),
+            "yielding to a subagent is not a human interruption"
+        );
+    }
+
+    #[test]
+    fn stop_after_the_last_subagent_finishes_needs_the_human() {
+        let (_d, root, id) = workspace_with_task();
+        record_state(&root, id, "pre-tool-use", "{}").unwrap();
+        record_state(&root, id, "subagent-stop", "{}").unwrap();
+        record_state(&root, id, "stop", "{}").unwrap();
+        assert_eq!(session_phase(&root, id).unwrap(), Phase::Idle);
+    }
+
+    #[test]
+    fn stop_while_one_of_two_subagents_still_runs_stays_working() {
+        let (_d, root, id) = workspace_with_task();
+        record_state(&root, id, "pre-tool-use", "{}").unwrap();
+        record_state(&root, id, "pre-tool-use", "{}").unwrap();
+        record_state(&root, id, "subagent-stop", "{}").unwrap();
+        record_state(&root, id, "stop", "{}").unwrap();
+        assert_eq!(session_phase(&root, id).unwrap(), Phase::Working);
+    }
+
+    #[test]
+    fn a_new_prompt_clears_leaked_subagents() {
+        let (_d, root, id) = workspace_with_task();
+        // a subagent that died without ever reporting back
+        record_state(&root, id, "pre-tool-use", "{}").unwrap();
+        record_state(&root, id, "user-prompt-submit", "{}").unwrap();
+        record_state(&root, id, "stop", "{}").unwrap();
+        assert_eq!(session_phase(&root, id).unwrap(), Phase::Idle);
+    }
+
+    #[test]
+    fn subagent_bookkeeping_firings_are_untracked() {
+        let (_d, root, id) = workspace_with_task();
+        assert!(!record_state(&root, id, "pre-tool-use", "{}").unwrap());
+        assert!(!record_state(&root, id, "subagent-stop", "{}").unwrap());
+        assert_eq!(session_phase(&root, id).unwrap(), Phase::Pending, "no state written");
+    }
+
+    #[test]
+    fn an_idle_notification_overrides_a_leaked_subagent() {
+        let (_d, root, id) = workspace_with_task();
+        record_state(&root, id, "pre-tool-use", "{}").unwrap();
+        record_state(&root, id, "stop", "{}").unwrap();
+        record_state(&root, id, "notification", "{\"notification_type\":\"idle_prompt\"}").unwrap();
+        assert!(session_phase(&root, id).unwrap().needs_human_input());
     }
 
     /// Create task 1 in `todo` in a fresh workspace.

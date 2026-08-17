@@ -154,15 +154,16 @@ pub fn prepare_session(
     let root_abs = std::fs::canonicalize(root)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| root.display().to_string());
-    let mk = |name: &str| {
+    let matched = |name: &str, matcher: &str| {
         serde_json::json!([{
-            "matcher": "",
+            "matcher": matcher,
             "hooks": [{
                 "type": "command",
                 "command": format!("{exe} hook {name} --root {root_abs} --session {id}"),
             }]
         }])
     };
+    let mk = |name: &str| matched(name, "");
     // Permissions are ADDITIVE alongside hooks. mcp/egress are intentionally not
     // wired here.
     // TODO(later thread): wire context.mcp into MCP config
@@ -178,6 +179,11 @@ pub fn prepare_session(
             "SessionStart": mk("session-start"),
             "UserPromptSubmit": mk("user-prompt-submit"),
             "SessionEnd": mk("session-end"),
+            // Bracket each subagent so a Stop that only yields to background work
+            // isn't mistaken for the agent waiting on the human. The Agent tool is
+            // called `Task` on older Claude Code builds and `Agent` on current ones.
+            "PreToolUse": matched("pre-tool-use", "Task|Agent"),
+            "SubagentStop": mk("subagent-stop"),
         },
     });
     let settings_path = sdir.join("hooks/settings.json");

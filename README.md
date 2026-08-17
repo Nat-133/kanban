@@ -32,6 +32,14 @@ it. A `SessionEnd` completes the task only when the human closed the session by 
 unrecognised reason is treated as an interruption, so a future Claude Code release can never
 silently mark work done.
 
+A `Stop` normally means the same thing — the turn is over, the human's move — except while a
+subagent is still running, when the agent is only yielding until that reports back. Each
+subagent is bracketed by `PreToolUse` and `SubagentStop` into a marker file under
+`sessions/<task>/background/`, and a `Stop` with any marker outstanding stays "working". A
+subagent that dies without reporting leaks a marker; the next prompt clears it, and Claude
+Code's own `idle_prompt` still raises the warning meanwhile, so the worst case is a late
+warning rather than a stuck card.
+
 Agents launched detached can die without emitting anything, so a liveness probe reconciles
 sessions whose terminal has vanished and marks them interrupted. Recovery is
 operator-triggered: opening an interrupted session resumes it with `--resume`; opening a live

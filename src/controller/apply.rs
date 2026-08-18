@@ -205,6 +205,17 @@ fn reorder_card(root: &Path, task_id: TaskId, position: usize) -> anyhow::Result
 /// so the recorded one is the live transcript and the old one is stale.
 /// `get_mut` rather than indexing: a hand-edited session.yaml could leave a
 /// trailing `--resume` with no value, and that must not panic the daemon.
+/// What a relaunched worker is doing the moment it comes back. A resumed
+/// transcript gets no prompt with it, so the agent sits at its prompt waiting for
+/// the human; a from-scratch launch is seeded with the handoff and starts working.
+fn relaunch_kind(resumed: bool) -> WorkerEventKind {
+    if resumed {
+        WorkerEventKind::HumanInputRequired(Notification::IdlePrompt)
+    } else {
+        WorkerEventKind::Started
+    }
+}
+
 fn continue_transcript(command: &mut Vec<String>, session_id: String) {
     // The seed prompt exists to get a fresh session reading its handoff. A resumed
     // conversation already holds it, so re-sending would replay the whole opening
@@ -253,7 +264,8 @@ fn rehandoff(root: &Path, task_id: TaskId, launcher: &dyn handoff::Launcher) -> 
     // with an empty status, and losing the session id would silently downgrade
     // the rehandoff into a from-scratch handoff.
     session.status = old.status.clone();
-    if let Some(sid) = session.status.session_id.clone() {
+    let resumed = session.status.session_id.clone();
+    if let Some(sid) = resumed.clone() {
         continue_transcript(&mut session.spec.command, sid);
     }
     let session_name = session.spec.session_name.clone().unwrap_or_default();
@@ -262,7 +274,7 @@ fn rehandoff(root: &Path, task_id: TaskId, launcher: &dyn handoff::Launcher) -> 
     task.status.worker_session_ref = Some(session.metadata.name.clone());
     store::save_task(root, &task)?;
     let event = WorkerEvent {
-        kind: WorkerEventKind::Started,
+        kind: relaunch_kind(resumed.is_some()),
         source: "rehandoff".to_string(),
         observed_at: time::OffsetDateTime::now_utc(),
         payload_ref: None,
@@ -293,16 +305,17 @@ fn resume(root: &Path, task_id: TaskId, launcher: &dyn handoff::Launcher) -> any
     // (it died before SessionStart ever fired) there is nothing to resume, so it
     // starts fresh from the handoff rather than refusing to come back at all.
     let mut command = session.spec.command.clone();
-    if let Some(sid) = session.status.session_id.clone() {
+    let resumed = session.status.session_id.clone();
+    if let Some(sid) = resumed.clone() {
         continue_transcript(&mut command, sid);
     }
     session.spec.command = command;
     launcher.launch(&session, &session_name)?;
     store::save_session(root, &session)?;
-    // Assert the running state immediately rather than waiting for the relaunched
+    // Assert the relaunched state immediately rather than waiting for the
     // agent's SessionStart hook, so the board reflects the resume at once.
     let event = WorkerEvent {
-        kind: WorkerEventKind::Started,
+        kind: relaunch_kind(resumed.is_some()),
         source: "resume".to_string(),
         observed_at: time::OffsetDateTime::now_utc(),
         payload_ref: None,
@@ -686,8 +699,9 @@ mod tests {
         let cmd = &cmds[0];
         let at = cmd.iter().position(|a| a == "--resume").expect("resume flag");
         assert_eq!(cmd[at + 1], "abc-123");
-        // The agent is running again: back to working, card in doing.
-        assert_eq!(crate::controller::events::session_phase(&r, id).unwrap(), Phase::Working);
+        // The agent is back, sitting at its prompt with nothing asked of it yet —
+        // idle, not working, so the card shows the warning rather than a spinner.
+        assert_eq!(crate::controller::events::session_phase(&r, id).unwrap(), Phase::Idle);
         let board = store::load_board(&r).unwrap();
         assert!(board.cards().get(&col("doing")).unwrap().contains(&id));
     }
@@ -722,6 +736,8 @@ mod tests {
 
         let cmds = launcher.launched.lock().unwrap();
         assert!(has_handoff_prompt(&cmds[0]), "nothing to resume, so it must start from the handoff");
+        // It was handed the prompt, so it really is working.
+        assert_eq!(crate::controller::events::session_phase(&r, id).unwrap(), Phase::Working);
     }
 
     #[test]
@@ -818,7 +834,7 @@ mod tests {
         let cmds = launcher.launched.lock().unwrap();
         let at = cmds[0].iter().position(|a| a == "--resume").expect("resume flag");
         assert_eq!(cmds[0][at + 1], "abc-123", "same conversation");
-        assert_eq!(crate::controller::events::session_phase(&r, id).unwrap(), Phase::Working);
+        assert_eq!(crate::controller::events::session_phase(&r, id).unwrap(), Phase::Idle);
     }
 
     #[test]

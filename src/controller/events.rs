@@ -22,7 +22,14 @@ pub struct IntakePayload {
 /// not reported back, which changes what a Stop means.
 fn to_event(item: &IntakePayload, background_pending: bool) -> Option<WorkerEvent> {
     let kind = match item.event.as_str() {
-        "session-start" => WorkerEventKind::Started,
+        // A resumed session is handed no prompt — its transcript already holds the
+        // handoff — so it comes up sitting at the prompt waiting for the human,
+        // not working. Any other start (fresh launch, /clear) is seeded with a
+        // turn and really is working.
+        "session-start" => match item.payload.get("source").and_then(|v| v.as_str()) {
+            Some("resume") => WorkerEventKind::HumanInputRequired(Notification::IdlePrompt),
+            _ => WorkerEventKind::Started,
+        },
         "user-prompt-submit" => WorkerEventKind::Working,
         // Stop fires when claude finishes its turn and hands control back to the
         // human — it is waiting for a response, not working. Treat it as idle so
@@ -379,6 +386,20 @@ mod tests {
         let board = store::load_board(&root).unwrap();
         // in-progress (needs human) -> stays in doing; the warning icon shows it's waiting.
         assert!(board.cards().get(&"doing".parse().unwrap()).unwrap().contains(&id));
+    }
+
+    #[test]
+    fn a_resumed_session_start_is_idle_not_working() {
+        let (_d, root, id) = workspace_with_task();
+        record_state(&root, id, "session-start", "{\"source\":\"resume\"}").unwrap();
+        assert_eq!(session_phase(&root, id).unwrap(), Phase::Idle);
+    }
+
+    #[test]
+    fn a_fresh_session_start_is_working() {
+        let (_d, root, id) = workspace_with_task();
+        record_state(&root, id, "session-start", "{\"source\":\"startup\"}").unwrap();
+        assert_eq!(session_phase(&root, id).unwrap(), Phase::Working);
     }
 
     #[test]

@@ -206,6 +206,10 @@ fn reorder_card(root: &Path, task_id: TaskId, position: usize) -> anyhow::Result
 /// `get_mut` rather than indexing: a hand-edited session.yaml could leave a
 /// trailing `--resume` with no value, and that must not panic the daemon.
 fn continue_transcript(command: &mut Vec<String>, session_id: String) {
+    // The seed prompt exists to get a fresh session reading its handoff. A resumed
+    // conversation already holds it, so re-sending would replay the whole opening
+    // turn instead of just picking up where the agent left off.
+    command.retain(|a| !a.starts_with(handoff::INITIAL_PROMPT_PREFIX));
     match command.iter().position(|a| a == "--resume") {
         Some(at) => match command.get_mut(at + 1) {
             Some(slot) => *slot = session_id,
@@ -688,6 +692,51 @@ mod tests {
         assert!(board.cards().get(&col("doing")).unwrap().contains(&id));
     }
 
+    /// The seeded first turn, recognised the way `continue_transcript` does.
+    fn has_handoff_prompt(cmd: &[String]) -> bool {
+        cmd.iter().any(|a| a.starts_with(handoff::INITIAL_PROMPT_PREFIX))
+    }
+
+    #[test]
+    fn resume_does_not_re_send_the_handoff_prompt() {
+        let d = setup(); let r = root(&d);
+        let id = interrupted_task(&r);
+        let launcher = DeadLauncher::default();
+
+        resume(&r, id, &launcher).unwrap();
+
+        let cmds = launcher.launched.lock().unwrap();
+        assert!(!has_handoff_prompt(&cmds[0]), "resumed transcript already holds it: {:?}", cmds[0]);
+    }
+
+    #[test]
+    fn resume_without_a_captured_session_id_keeps_the_handoff_prompt() {
+        let d = setup(); let r = root(&d);
+        apply(&r, Intent::CreateTask { text: "A".into(), column: col("todo") }).unwrap();
+        let id = TaskId::new(1);
+        handoff::handoff(&r, id, "claude", &NoLaunch).unwrap();
+        crate::controller::events::record_state(&r, id, "session-end", "{\"reason\":\"other\"}").unwrap();
+        let launcher = DeadLauncher::default();
+
+        resume(&r, id, &launcher).unwrap();
+
+        let cmds = launcher.launched.lock().unwrap();
+        assert!(has_handoff_prompt(&cmds[0]), "nothing to resume, so it must start from the handoff");
+    }
+
+    #[test]
+    fn handoff_seeds_the_prompt_without_resuming() {
+        let d = setup(); let r = root(&d);
+        apply(&r, Intent::CreateTask { text: "A".into(), column: col("todo") }).unwrap();
+        let launcher = DeadLauncher::default();
+
+        handoff::handoff(&r, TaskId::new(1), "claude", &launcher).unwrap();
+
+        let cmds = launcher.launched.lock().unwrap();
+        assert!(has_handoff_prompt(&cmds[0]));
+        assert!(!cmds[0].contains(&"--resume".to_string()));
+    }
+
     #[test]
     fn resume_does_not_stack_resume_flags_when_run_twice() {
         let d = setup(); let r = root(&d);
@@ -770,6 +819,18 @@ mod tests {
         let at = cmds[0].iter().position(|a| a == "--resume").expect("resume flag");
         assert_eq!(cmds[0][at + 1], "abc-123", "same conversation");
         assert_eq!(crate::controller::events::session_phase(&r, id).unwrap(), Phase::Working);
+    }
+
+    #[test]
+    fn rehandoff_does_not_re_send_the_handoff_prompt() {
+        let d = setup(); let r = root(&d);
+        let id = live_task(&r);
+        let launcher = LiveLauncher::default();
+
+        rehandoff(&r, id, &launcher).unwrap();
+
+        let cmds = launcher.launched.lock().unwrap();
+        assert!(!has_handoff_prompt(&cmds[0]), "{:?}", cmds[0]);
     }
 
     #[test]

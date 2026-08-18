@@ -197,12 +197,7 @@ pub fn prepare_session(
     // `--settings <path>` pair (now at indices 1 and 2): a leading positional
     // could be mistaken for the `[command]` subcommand slot, while a trailing one
     // would be swallowed by the variadic `--add-dir <dirs...>` that follows.
-    let prompt = format!(
-        "Read the task handoff at {} and start working on the task it describes, \
-         following the instructions in that file.",
-        work.join("handoff.md").display()
-    );
-    command.insert(3, prompt);
+    command.insert(3, initial_prompt(&work));
 
     // workdir: the task's repo (tilde-expanded) if set, else the agent's work/ sandbox
     let workdir = match repo {
@@ -228,6 +223,19 @@ pub fn prepare_session(
         },
         status: Default::default(),
     })
+}
+
+/// Opening words of the seeded first turn. Stable enough to recognise the prompt
+/// in an already-built command, so a resume can drop it.
+pub const INITIAL_PROMPT_PREFIX: &str = "Read the task handoff at ";
+
+/// The first turn a freshly launched agent is given.
+pub fn initial_prompt(work: &Path) -> String {
+    format!(
+        "{INITIAL_PROMPT_PREFIX}{} and start working on the task it describes, \
+         following the instructions in that file.",
+        work.join("handoff.md").display()
+    )
 }
 
 /// Tie handoff together: prepare the session, launch it, persist `session.yaml`,

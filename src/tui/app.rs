@@ -201,6 +201,35 @@ impl App {
             .map(|s| s.task)
     }
 
+    /// Whether `task` has a session blocked on a human that can still be attached
+    /// to. An `Interrupted` agent is not blocked — it is gone, and reviving it is
+    /// `t`'s job, not something navigation should do behind the operator's back.
+    fn is_blocked(&self, task: TaskId) -> bool {
+        self.session_for(task)
+            .is_some_and(|s| s.phase.needs_human_input() && !s.session_name.is_empty())
+    }
+
+    /// The next (`dir` = 1) or previous (`dir` = -1) blocked task in board order,
+    /// starting from `from` and wrapping. `None` when no *other* task is blocked.
+    /// Ordering follows the visible board, so a search filter narrows the cycle.
+    pub fn blocked_after(&self, from: TaskId, dir: isize) -> Option<TaskId> {
+        let order: Vec<TaskId> =
+            (0..self.columns().len()).flat_map(|col| self.visible_cards(col)).collect();
+        let n = order.len() as isize;
+        if n == 0 {
+            return None;
+        }
+        // A `from` the filter hides has no place in the cycle, so start at the
+        // near end of the board rather than skipping a card that belongs in it.
+        let (start, steps) = match order.iter().position(|t| *t == from) {
+            Some(p) => (p as isize, 1..n),
+            None => (0, 0..n),
+        };
+        steps
+            .map(|step| order[(start + step * dir).rem_euclid(n) as usize])
+            .find(|t| self.is_blocked(*t))
+    }
+
     /// The current filter text (active when in `Search` mode or non-empty).
     pub fn filter(&self) -> &str {
         &self.filter
@@ -704,6 +733,105 @@ mod tests {
         let app = App::new(s);
         assert_eq!(app.session_for(TaskId::new(1)).unwrap().phase, Phase::WaitingHuman);
         assert!(app.session_for(TaskId::new(2)).is_none());
+    }
+
+    /// A snapshot of four cards in `todo`, with a session per `(task, phase)` pair.
+    fn snap_with_sessions(phases: &[(u32, crate::model::Phase)]) -> Snapshot {
+        use crate::controller::{apply::apply, store};
+        use crate::model::proto::SessionView;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        for title in ["One", "Two", "Three", "Four"] {
+            apply(&root, Intent::CreateTask { text: title.into(), column: "todo".parse().unwrap() }).unwrap();
+        }
+        Snapshot {
+            board: store::load_board(&root).unwrap(),
+            tasks: store::load_all_tasks(&root).unwrap(),
+            sessions: phases
+                .iter()
+                .map(|(n, phase)| SessionView {
+                    task: TaskId::new(*n),
+                    session_name: format!("kanban-task-{n:04}"),
+                    phase: *phase,
+                    needs_human_input: phase.needs_human_input(),
+                })
+                .collect(),
+            descriptions: Default::default(),
+        }
+    }
+
+    #[test]
+    fn blocked_after_skips_working_sessions_and_cards_without_one() {
+        use crate::model::Phase;
+        let app = App::new(snap_with_sessions(&[
+            (1, Phase::WaitingHuman),
+            (2, Phase::Working),
+            (4, Phase::Idle),
+        ]));
+        // task-0003 has no session at all, task-0002 is busy: 1 → 4.
+        assert_eq!(app.blocked_after(TaskId::new(1), 1), Some(TaskId::new(4)));
+    }
+
+    #[test]
+    fn blocked_after_wraps_in_both_directions() {
+        use crate::model::Phase;
+        let app = App::new(snap_with_sessions(&[(1, Phase::Idle), (3, Phase::WaitingHuman)]));
+        assert_eq!(app.blocked_after(TaskId::new(3), 1), Some(TaskId::new(1)));
+        assert_eq!(app.blocked_after(TaskId::new(1), -1), Some(TaskId::new(3)));
+    }
+
+    #[test]
+    fn blocked_after_crosses_columns_in_board_order() {
+        use crate::model::Phase;
+        use crate::model::proto::SessionView;
+        let ws = Workspace::with_cards(&["One", "Two", "Three"]);
+        let to_column = ws.snapshot().board.columns()[1].id.clone();
+        ws.apply(Intent::MoveCard { task: TaskId::new(3), to_column, position: Some(0) });
+        let mut s = ws.snapshot();
+        s.sessions = vec![SessionView {
+            task: TaskId::new(3),
+            session_name: "kanban-task-0003".into(),
+            phase: Phase::WaitingHuman,
+            needs_human_input: true,
+        }];
+        let app = App::new(s);
+        assert_eq!(app.blocked_after(TaskId::new(1), 1), Some(TaskId::new(3)));
+    }
+
+    #[test]
+    fn blocked_after_ignores_an_interrupted_agent() {
+        use crate::model::Phase;
+        let app = App::new(snap_with_sessions(&[
+            (1, Phase::WaitingHuman),
+            (2, Phase::Interrupted),
+        ]));
+        assert_eq!(app.blocked_after(TaskId::new(1), 1), None);
+    }
+
+    #[test]
+    fn blocked_after_finds_nothing_when_only_the_current_card_is_blocked() {
+        use crate::model::Phase;
+        let app = App::new(snap_with_sessions(&[(2, Phase::WaitingHuman)]));
+        assert_eq!(app.blocked_after(TaskId::new(2), 1), None);
+        assert_eq!(app.blocked_after(TaskId::new(2), -1), None);
+    }
+
+    #[test]
+    fn blocked_after_only_cycles_cards_the_filter_leaves_visible() {
+        use crate::model::Phase;
+        let mut app = App::new(snap_with_sessions(&[
+            (1, Phase::WaitingHuman),
+            (2, Phase::WaitingHuman),
+            (4, Phase::WaitingHuman),
+        ]));
+        app.on_key(key('/'));
+        for c in "our".chars() {
+            app.on_key(key(c));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // Only "Four" survives the filter, so there is nowhere else to go.
+        assert_eq!(app.blocked_after(TaskId::new(4), 1), None);
     }
 
     #[test]

@@ -172,7 +172,9 @@ pub fn render_terminal_popup(f: &mut Frame, area: Rect, screen: &tui_term::vt100
     let popup = centered_rect_pct(90, 90, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {title} — Ctrl+G q to close, Ctrl+G r to re-hand off "));
+        .title(format!(
+            " {title} — Ctrl+G q to close, r to re-hand off, n/p for the next blocked card "
+        ));
     let term = PseudoTerminal::new(screen).block(block);
     f.render_widget(Clear, popup);
     f.render_widget(term, popup);
@@ -190,6 +192,9 @@ pub enum TermAction {
     /// Hand the task off again into the same conversation (fresh hooks and
     /// handoff, `--resume`d transcript), then re-attach.
     Rehandoff,
+    /// Re-attach the popup to the next (`+1`) or previous (`-1`) session that is
+    /// blocked on a human.
+    JumpBlocked(isize),
     /// Swallow the key (e.g. it just armed the prefix, or was unrecognised).
     None,
 }
@@ -231,6 +236,8 @@ pub fn handle_prefixed_key(armed: bool, key: KeyEvent) -> (bool, TermAction) {
             KeyCode::Char('q') | KeyCode::Esc => (false, TermAction::Close),
             KeyCode::Char('T') => (false, TermAction::Fullscreen),
             KeyCode::Char('r') => (false, TermAction::Rehandoff),
+            KeyCode::Char('n') => (false, TermAction::JumpBlocked(1)),
+            KeyCode::Char('p') => (false, TermAction::JumpBlocked(-1)),
             // Unrecognised command: disarm and swallow.
             _ => (false, TermAction::None),
         }
@@ -430,6 +437,12 @@ mod tests {
     #[test]
     fn prefixed_r_asks_for_a_rehandoff() {
         assert_eq!(handle_prefixed_key(true, key('r')), (false, TermAction::Rehandoff));
+    }
+
+    #[test]
+    fn prefixed_n_and_p_jump_between_blocked_sessions() {
+        assert_eq!(handle_prefixed_key(true, key('n')), (false, TermAction::JumpBlocked(1)));
+        assert_eq!(handle_prefixed_key(true, key('p')), (false, TermAction::JumpBlocked(-1)));
     }
 
     #[test]

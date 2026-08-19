@@ -88,4 +88,6 @@ Inside the terminal popup, `Ctrl+G` prefixes the popup's own commands: `q` close
 re-attaches full-screen, and `r` re-hands the task off — the terminal is killed and the agent
 relaunched with regenerated hooks, handoff and allowlist, `--resume`d onto the same
 conversation. That is the only way a change to what a session is given reaches a running
-agent, since Claude reads `--settings` once at launch.
+agent, since Claude reads `--settings` once at launch. `n` and `p` move the popup to the
+next and previous card blocked on a human, so a round of replies needs no trip back to the
+board.

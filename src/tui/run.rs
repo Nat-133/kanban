@@ -66,6 +66,8 @@ enum Post {
     Fullscreen(String),
     /// Re-hand off the task behind the popup's session, then re-attach.
     Rehandoff(String),
+    /// Move the popup to the next/previous blocked session.
+    JumpBlocked(String, isize),
 }
 
 async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
@@ -130,6 +132,7 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                                     TermAction::Close => Post::Close,
                                     TermAction::Fullscreen => Post::Fullscreen(t.name().to_string()),
                                     TermAction::Rehandoff => Post::Rehandoff(t.name().to_string()),
+                                    TermAction::JumpBlocked(dir) => Post::JumpBlocked(t.name().to_string(), dir),
                                 }
                             } else {
                                 Post::Nothing
@@ -172,6 +175,33 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                                             }
                                         }
                                         None => app.status = Some(format!("no task owns session {name}")),
+                                    }
+                                }
+                                // Resolve the target before detaching, so a jump
+                                // with nowhere to go leaves the popup untouched.
+                                Post::JumpBlocked(name, dir) => {
+                                    let target = app
+                                        .task_for_session(&name)
+                                        .and_then(|task| app.blocked_after(task, dir))
+                                        .and_then(|task| {
+                                            let name = app.session_for(task)?.session_name.clone();
+                                            Some((task, name))
+                                        });
+                                    match target {
+                                        Some((task, session)) => {
+                                            term = None;
+                                            app.select_task(task);
+                                            open_terminal_popup(&session, terminal, &mut term, &mut app, &redraw_tx);
+                                            // The old PTY is already gone, so a
+                                            // failed attach must fall back to the
+                                            // board rather than a popup-less
+                                            // Terminal mode that eats every key.
+                                            if term.is_none() {
+                                                set_mouse_capture(false);
+                                                app.exit_terminal();
+                                            }
+                                        }
+                                        None => app.status = Some("no other blocked session".into()),
                                     }
                                 }
                                 Post::Fullscreen(name) => {

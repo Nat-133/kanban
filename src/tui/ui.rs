@@ -138,6 +138,8 @@ pub fn render(f: &mut Frame, app: &App, term_screen: Option<&tui_term::vt100::Sc
                 "  c            hand off selected task",
                 "  t / T        open the agent's session (popup / fullscreen);",
                 "               resumes it first if it was interrupted",
+                "  in the popup: Ctrl+G q closes, r re-hands off,",
+                "               n / p jump to the next / previous blocked card",
                 "  d            archive selected task",
                 "  ?            toggle this help",
                 "  q            quit",

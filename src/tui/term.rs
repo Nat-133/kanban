@@ -385,6 +385,24 @@ pub fn encode_mouse(
     }
 }
 
+/// The bytes for pasting `text` into the inner session in one go. `bracketed`
+/// is the inner screen's own paste mode (tmux forwards the pane app's DECSET
+/// 2004): when it is on the markers tell the app the block is a paste, not
+/// typing, so it neither submits nor re-indents per line. Without them a
+/// newline can only be sent as the Enter the app would have seen anyway.
+pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        let mut bytes = b"\x1b[200~".to_vec();
+        // An end marker inside the payload would end the paste early, leaving
+        // the rest to be read as keystrokes.
+        bytes.extend_from_slice(text.replace("\x1b[201~", "").as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        bytes
+    } else {
+        text.replace('\n', "\r").into_bytes()
+    }
+}
+
 /// The argv for attaching to a tmux session by name.
 pub fn tmux_attach_argv(session: &str) -> Vec<String> {
     vec![
@@ -406,6 +424,27 @@ mod tests {
     }
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn paste_is_wrapped_in_markers_when_the_inner_app_wants_them() {
+        assert_eq!(
+            encode_paste("one\ntwo", true),
+            b"\x1b[200~one\ntwo\x1b[201~".to_vec()
+        );
+    }
+
+    #[test]
+    fn paste_without_markers_sends_newlines_as_returns() {
+        assert_eq!(encode_paste("one\ntwo", false), b"one\rtwo".to_vec());
+    }
+
+    #[test]
+    fn paste_payload_cannot_end_its_own_bracket() {
+        assert_eq!(
+            encode_paste("a\x1b[201~b", true),
+            b"\x1b[200~ab\x1b[201~".to_vec()
+        );
     }
 
     #[test]

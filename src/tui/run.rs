@@ -4,9 +4,13 @@ use crate::model::proto::Response;
 use crate::tui::app::{Action, App, Mode};
 use crate::tui::client::Client;
 use crate::tui::term::{
-    encode_mouse, handle_prefixed_key, mouse_cell, popup_pty_size, TermAction, TermSession,
+    encode_mouse, encode_paste, handle_prefixed_key, mouse_cell, popup_pty_size, TermAction,
+    TermSession,
 };
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -29,7 +33,10 @@ pub async fn run(base: String) -> anyhow::Result<()> {
     // Terminal setup.
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Bracketed paste keeps a pasted block one event: without it the newlines
+    // arrive as Enter keys, which submit a modal or the inner agent's prompt
+    // line by line.
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -40,7 +47,11 @@ pub async fn run(base: String) -> anyhow::Result<()> {
     // when the popup closes; disable it again in case we exited with one open.
     set_mouse_capture(false);
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     result
@@ -288,6 +299,17 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                             }
                         }
                     }
+                    // Paste — one block, so it lands as a paste rather than as
+                    // the run of Enter keys the newlines would otherwise be.
+                    Some(Ok(Event::Paste(text))) => {
+                        match term.as_mut() {
+                            Some(t) => {
+                                let bracketed = t.parser().read().unwrap().screen().bracketed_paste();
+                                let _ = t.write_input(&encode_paste(&text, bracketed));
+                            }
+                            None => app.on_paste(&text),
+                        }
+                    }
                     // Mouse — forwarded to the inner session while the popup is
                     // open (tmux with `mouse on` turns the wheel into scrollback).
                     Some(Ok(Event::Mouse(me))) => {
@@ -381,7 +403,13 @@ async fn refresh(client: &Client, app: &mut App) {
 /// itself runs inside tmux; on detach we restore the alternate screen.
 fn fullscreen_attach(terminal: &mut Term, name: &str) {
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    // The attached tmux client sets up paste mode for itself; hand the terminal
+    // back in the state it would have found had the TUI never run.
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
     let _ = std::process::Command::new("tmux")
         .arg("attach")
         .arg("-t")
@@ -389,7 +417,11 @@ fn fullscreen_attach(terminal: &mut Term, name: &str) {
         .env_remove("TMUX")
         .status();
     let _ = enable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen);
+    let _ = execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableBracketedPaste
+    );
     // Force a query-free full repaint. `Terminal::clear()` first queries the
     // cursor position over stdin, which races with the live crossterm
     // EventStream reader and silently no-ops (leaving tmux residue on screen);

@@ -362,6 +362,24 @@ impl App {
         }
     }
 
+    /// Insert pasted text into whatever is taking input. A paste is never a
+    /// submit, so the multi-line modals keep the line breaks and stay open;
+    /// the single-line filter flattens them.
+    pub fn on_paste(&mut self, text: &str) {
+        match self.mode {
+            Mode::AddTask | Mode::EditTask | Mode::EditDescription => {
+                if let Some(e) = self.editor.as_mut() {
+                    e.insert_str(text);
+                }
+            }
+            Mode::Search => {
+                self.filter.push_str(&text.replace(['\n', '\r'], " "));
+                self.sync();
+            }
+            _ => {}
+        }
+    }
+
     /// Enter terminal-popup mode (the run loop owns the live `TermSession`).
     pub fn enter_terminal(&mut self) {
         self.mode = Mode::Terminal;
@@ -1087,6 +1105,24 @@ mod tests {
         // A bare Enter then submits the whole box.
         let action = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(action, Action::Send(Intent::CreateTask { .. })));
+    }
+
+    #[test]
+    fn paste_keeps_its_newlines_and_leaves_the_box_open() {
+        let mut app = App::new(snap());
+        app.on_key(key('a'));
+        app.on_paste("one\ntwo");
+        assert_eq!(app.editor_text().as_deref(), Some("one\ntwo"));
+        assert!(matches!(app.mode(), Mode::AddTask), "a paste is not a submit");
+    }
+
+    #[test]
+    fn paste_into_search_flattens_newlines() {
+        let mut app = App::new(snap());
+        app.on_key(key('/'));
+        app.on_paste("fir\nst");
+        assert!(matches!(app.mode(), Mode::Search));
+        assert_eq!(app.filter, "fir st");
     }
 
     #[test]

@@ -56,10 +56,7 @@ pub fn apply(root: &Path, intent: Intent) -> anyhow::Result<Response> {
         Intent::Rehandoff { task } => rehandoff(root, task, &handoff::TmuxLauncher),
         Intent::SetProfile { task, profile } => set_profile(root, task, profile),
         Intent::Handoff { task, worker } => {
-            match handoff::handoff(root, task, &worker, &handoff::TmuxLauncher) {
-                Ok(()) => Ok(Response::Ok { task: Some(task) }),
-                Err(e) => Ok(Response::Error { message: e.to_string() }),
-            }
+            ensure_session(root, task, &worker, &handoff::TmuxLauncher)
         }
     }
 }
@@ -282,6 +279,34 @@ fn rehandoff(root: &Path, task_id: TaskId, launcher: &dyn handoff::Launcher) -> 
     store::save_state(root, task_id, &event)?;
     crate::controller::events::ingest_session(root, task_id)?;
     Ok(Response::Ok { task: Some(task_id) })
+}
+
+/// Drive a task towards "has a running agent", whatever state it starts in: hand
+/// off when it has no session, revive it when its terminal is gone, and do
+/// nothing when the agent is already there.
+///
+/// Convergent rather than create-only because this is what the operator's key
+/// press means. A second handoff of the same task used to re-prepare it from
+/// scratch, overwriting `session.yaml` with an empty status and losing the
+/// session id that resume needs — silently, whenever the terminal happened to be
+/// dead. Routing every request through here leaves `handoff::handoff` reachable
+/// only for a task that has nothing to lose.
+fn ensure_session(
+    root: &Path,
+    task_id: TaskId,
+    worker_name: &str,
+    launcher: &dyn handoff::Launcher,
+) -> anyhow::Result<Response> {
+    let Some(session) = store::load_session(root, task_id)? else {
+        return match handoff::handoff(root, task_id, worker_name, launcher) {
+            Ok(()) => Ok(Response::Ok { task: Some(task_id) }),
+            Err(e) => Ok(Response::Error { message: e.to_string() }),
+        };
+    };
+    if launcher.is_alive(session.spec.session_name.as_deref().unwrap_or_default()) {
+        return Ok(Response::Ok { task: Some(task_id) });
+    }
+    resume(root, task_id, launcher)
 }
 
 /// Relaunch a worker whose terminal session is gone, continuing its own
@@ -794,6 +819,51 @@ mod tests {
             Response::Error { message } => assert!(message.contains("still running"), "{message}"),
             o => panic!("expected an error, got {o:?}"),
         }
+    }
+
+    #[test]
+    fn ensure_session_hands_off_a_task_that_has_none() {
+        let d = setup(); let r = root(&d);
+        apply(&r, Intent::CreateTask { text: "A".into(), column: col("todo") }).unwrap();
+        let id = TaskId::new(1);
+        let launcher = DeadLauncher::default();
+
+        assert_eq!(ensure_session(&r, id, "claude", &launcher).unwrap(), Response::Ok { task: Some(id) });
+
+        assert_eq!(launcher.launched.lock().unwrap().len(), 1);
+        assert!(store::load_session(&r, id).unwrap().is_some());
+    }
+
+    #[test]
+    fn ensure_session_revives_an_interrupted_task_instead_of_re_preparing_it() {
+        // The bug this replaced: a second handoff overwrote session.yaml with an
+        // empty status, so the transcript was lost and the agent started over.
+        let d = setup(); let r = root(&d);
+        let id = interrupted_task(&r);
+        let launcher = DeadLauncher::default();
+
+        ensure_session(&r, id, "claude", &launcher).unwrap();
+
+        let cmds = launcher.launched.lock().unwrap();
+        let at = cmds[0].iter().position(|a| a == "--resume").expect("resume flag");
+        assert_eq!(cmds[0][at + 1], "abc-123", "same conversation");
+        assert!(!has_handoff_prompt(&cmds[0]));
+        assert_eq!(
+            store::load_session(&r, id).unwrap().unwrap().status.session_id.as_deref(),
+            Some("abc-123"),
+        );
+    }
+
+    #[test]
+    fn ensure_session_leaves_a_running_agent_alone() {
+        let d = setup(); let r = root(&d);
+        let id = live_task(&r);
+        let launcher = LiveLauncher::default();
+
+        assert_eq!(ensure_session(&r, id, "claude", &launcher).unwrap(), Response::Ok { task: Some(id) });
+
+        assert!(launcher.launched.lock().unwrap().is_empty(), "no second agent on one task");
+        assert!(launcher.killed.lock().unwrap().is_empty(), "and the live one is not torn down");
     }
 
     /// Live sessions (like tmux really is when the popup is open), recording both

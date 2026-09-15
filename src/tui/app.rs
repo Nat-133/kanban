@@ -308,6 +308,17 @@ impl App {
         self.snapshot.descriptions.get(&id).map(String::as_str)
     }
 
+    /// What `c` is about to do to `task`, phrased from the phase the board
+    /// already shows. The controller converges rather than refusing, so without
+    /// this a `c` on the wrong card looks like it did nothing.
+    fn handoff_status(&self, task: TaskId) -> String {
+        match self.session_for(task).map(|s| s.phase) {
+            None => format!("handing off {task}"),
+            Some(crate::model::Phase::Interrupted) => format!("resuming {task}"),
+            Some(_) => format!("{task} is already running"),
+        }
+    }
+
     /// Open the selected task's worker session. An interrupted agent — one a
     /// crash or shutdown killed — has no terminal session left to attach to, so
     /// opening it resumes it first; the caller attaches once the relaunch lands.
@@ -488,6 +499,7 @@ impl App {
             },
             KeyCode::Char('c') => {
                 if let Some(t) = self.selected_task() {
+                    self.status = Some(self.handoff_status(t));
                     return Action::Send(Intent::Handoff { task: t, worker: "claude".into() });
                 }
                 Action::None
@@ -1068,6 +1080,23 @@ mod tests {
         let mut app = App::new(snap());
         let action = app.on_key(key('c'));
         assert_eq!(action, Action::Send(Intent::Handoff { task: TaskId::new(1), worker: "claude".into() }));
+    }
+
+    #[test]
+    fn c_says_what_it_will_do_to_a_card_that_already_has_a_session() {
+        // The controller converges instead of refusing, so the status line is the
+        // only thing telling a mis-keyed `c` apart from a real handoff.
+        let mut app = App::new(snap());
+        app.on_key(key('c'));
+        assert_eq!(app.status.as_deref(), Some("handing off task-0001"));
+
+        let mut app = App::new(snap_with_phase(crate::model::Phase::Interrupted));
+        app.on_key(key('c'));
+        assert_eq!(app.status.as_deref(), Some("resuming task-0001"));
+
+        let mut app = App::new(snap_with_phase(crate::model::Phase::Working));
+        app.on_key(key('c'));
+        assert_eq!(app.status.as_deref(), Some("task-0001 is already running"));
     }
 
     #[test]

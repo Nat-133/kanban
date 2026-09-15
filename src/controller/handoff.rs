@@ -240,6 +240,12 @@ pub fn initial_prompt(work: &Path) -> String {
 
 /// Tie handoff together: prepare the session, launch it, persist `session.yaml`,
 /// and record the session ref on the task. Unknown worker -> error.
+///
+/// Creates a session from scratch, so it is only ever right for a task that has
+/// none: preparing again would overwrite `session.yaml` with an empty status and
+/// drop the session id every later resume needs. Callers go through
+/// `apply::ensure_session`, which picks this path only when there is nothing to
+/// revive.
 pub fn handoff(root: &Path, task_id: TaskId, worker_name: &str, launcher: &dyn Launcher) -> anyhow::Result<()> {
     let cfg = store::load_config(root)?;
     let worker = cfg.workers.get(worker_name)

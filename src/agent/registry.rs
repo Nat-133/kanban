@@ -20,6 +20,23 @@ pub enum Status {
     Waiting,
 }
 
+impl Status {
+    /// The worker event this status represents.
+    ///
+    /// `waiting` covers any open dialog, not only a permission prompt, so the
+    /// notification kind is narrower than the states it stands for. Both idle
+    /// and waiting derive to phases that report `needs_human_input`, which is
+    /// the distinction the board actually draws.
+    pub fn event_kind(self) -> crate::model::WorkerEventKind {
+        use crate::model::{Notification, WorkerEventKind};
+        match self {
+            Status::Busy | Status::Shell => WorkerEventKind::Working,
+            Status::Idle => WorkerEventKind::HumanInputRequired(Notification::IdlePrompt),
+            Status::Waiting => WorkerEventKind::HumanInputRequired(Notification::PermissionPrompt),
+        }
+    }
+}
+
 /// One session's registry record.
 #[derive(Debug, Clone, Default)]
 pub struct Record {
@@ -110,6 +127,17 @@ mod tests {
         assert!(read(d.path(), 7).is_none());
         write(d.path(), 8, "not json at all");
         assert!(read(d.path(), 8).is_none());
+    }
+
+    #[test]
+    fn status_maps_to_the_phase_the_board_shows() {
+        use crate::model::{Notification as N, WorkerEventKind as K};
+        assert_eq!(Status::Busy.event_kind(), K::Working);
+        // Shell mode is the human running a command in the pane. The agent is
+        // not waiting on them, so it must not raise the warning icon.
+        assert_eq!(Status::Shell.event_kind(), K::Working);
+        assert_eq!(Status::Idle.event_kind(), K::HumanInputRequired(N::IdlePrompt));
+        assert_eq!(Status::Waiting.event_kind(), K::HumanInputRequired(N::PermissionPrompt));
     }
 
     #[test]

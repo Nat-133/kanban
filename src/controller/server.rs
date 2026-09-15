@@ -2,7 +2,7 @@
 
 use crate::controller::apply::apply;
 use crate::controller::workspace::Workspace;
-use crate::controller::{events, handoff, store};
+use crate::controller::{events, store};
 use crate::model::proto::{Intent, Response, WakeRequest};
 use crate::model::TaskId;
 use axum::response::sse::{Event, Sse};
@@ -13,28 +13,21 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 
 /// Backstop reconcile cadence. The `/v1/wake` poke is the primary path and is
-/// effectively instant on localhost (the hook always resolves an address, falling
+/// effectively instant on localhost (the agent always resolves an address, falling
 /// back to the default, so it can't be silently skipped). This periodic pass is the
-/// safety net: it re-reads state, applies any card moves, and broadcasts if anything
-/// the UI can see changed — covering the rare case where a poke can't be delivered
-/// (no daemon was up at hook time, or it restarted on a different port).
+/// safety net: it checks liveness, re-reads state, applies any card moves, and
+/// broadcasts if anything the UI can see changed — covering the rare case where a
+/// poke can't be delivered (no daemon was up, or it restarted on a different port).
 const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Liveness sweep cadence. Deliberately far slower than the reconcile pass: it
-/// shells out to the multiplexer once per running session, and an agent dying
-/// without a hook firing is rare enough that noticing within half a minute is
-/// ample. The sweep that matters most runs once at startup, catching every
-/// session the machine killed while the daemon was down.
-const LIVENESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// File under the workspace root holding the daemon's bound address (e.g.
-/// `127.0.0.1:7777`). Written on startup so the hook process can find the daemon
-/// to poke without being told where it is.
+/// `127.0.0.1:7777`). Written on startup so an agent can find the daemon to poke
+/// without being told where it is.
 pub fn addr_path(root: &Path) -> PathBuf {
     root.join("daemon.addr")
 }
 
-/// Record the daemon's bound address so hooks can locate it.
+/// Record the daemon's bound address so agents can locate it.
 pub fn write_daemon_addr(root: &Path, addr: std::net::SocketAddr) -> anyhow::Result<()> {
     store::atomic_write(&addr_path(root), &addr.to_string())
 }
@@ -51,7 +44,7 @@ pub fn read_daemon_addr(root: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// The address a hook should poke: the recorded `daemon.addr`, or the default if
+/// The address an agent should poke: the recorded `daemon.addr`, or the default if
 /// that file is missing. Always returns something so the instant poke path is
 /// never silently skipped — a missing file must not disable it.
 pub fn daemon_addr(root: &Path) -> String {
@@ -93,9 +86,9 @@ pub fn router(ws: Workspace, changes: broadcast::Sender<()>) -> Router {
 
 /// Doorbell handler: re-read one session's state, move its card to match, and
 /// notify subscribers. The body carries only the id; the new state was already
-/// written to the session's `state.yaml` by the hook.
+/// written to the session's `state.yaml` by the agent that reported it.
 ///
-/// A wake only fires because the hook recorded a *new* worker event, so it always
+/// A wake only fires because the agent recorded a *changed* state, so it always
 /// represents a real change — and the card's icon tracks phase, not just column.
 /// So we always broadcast, even when the card stays put (e.g. working -> idle both
 /// live in `doing`); otherwise the UI's spinner/warning would go stale.
@@ -149,13 +142,13 @@ pub async fn serve(root: PathBuf, addr: std::net::SocketAddr) -> anyhow::Result<
 
     // Startup recovery. Any session still claiming to be working is either a live
     // agent we're reconnecting to or one the machine killed while we were down —
-    // probe before serving so the first board the UI renders tells the truth.
-    if let Err(e) = crate::controller::recover::reconcile_liveness(&root, &handoff::TmuxLauncher) {
+    // check before serving so the first board the UI renders tells the truth.
+    if let Err(e) = crate::controller::recover::reconcile_liveness(&root) {
         tracing::warn!(error = %e, "startup liveness sweep failed");
     }
 
-    // From here on every writer — request handlers and both background sweeps —
-    // shares this one handle, so their read-modify-writes can't interleave.
+    // From here on every writer — request handlers and the reconcile pass — shares
+    // this one handle, so their read-modify-writes can't interleave.
     let ws = Workspace::new(root.clone());
     let (tx, _rx) = broadcast::channel(64);
     // Periodic reconcile: re-read every session's state, move cards to match, and
@@ -174,6 +167,11 @@ pub async fn serve(root: PathBuf, addr: std::net::SocketAddr) -> anyhow::Result<
                 let ws = ws.clone();
                 let fp = tokio::task::spawn_blocking(move || {
                     ws.write(|r| {
+                        // Catch an agent that died without reporting. Reading a
+                        // heartbeat file is cheap enough to do every tick, so it
+                        // rides along with the reconcile rather than lagging
+                        // behind on a timer of its own.
+                        let _ = crate::controller::recover::reconcile_liveness(r);
                         let _ = crate::controller::events::reconcile_all(r); // apply any column moves
                         crate::controller::events::observable_fingerprint(r)
                     })
@@ -188,34 +186,9 @@ pub async fn serve(root: PathBuf, addr: std::net::SocketAddr) -> anyhow::Result<
             }
         });
     }
-    // Periodic liveness sweep: catches an agent that dies mid-session without its
-    // SessionEnd hook ever firing. Broadcasts only when it actually marked
-    // something, so a quiet sweep costs the UI nothing.
-    {
-        let ws = ws.clone();
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(LIVENESS_INTERVAL);
-            tick.tick().await; // the immediate first tick is the startup sweep we just ran
-            loop {
-                tick.tick().await;
-                let ws = ws.clone();
-                let changed = tokio::task::spawn_blocking(move || {
-                    ws.write(|r| crate::controller::recover::reconcile_liveness(r, &handoff::TmuxLauncher))
-                })
-                .await;
-                match changed {
-                    Ok(Ok(true)) => { let _ = tx.send(()); }
-                    Ok(Err(e)) => tracing::warn!(error = %e, "liveness sweep failed"),
-                    _ => {}
-                }
-            }
-        });
-    }
-
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
-    // Publish where we're listening so hook processes can poke us.
+    // Publish where we're listening so agents can poke us.
     write_daemon_addr(&root, bound)?;
     tracing::info!(addr = %bound, "controller listening");
     axum::serve(listener, router(ws, tx)).await?;

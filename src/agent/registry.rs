@@ -1,0 +1,124 @@
+//! Reading Claude Code's own per-session status.
+//!
+//! Claude Code writes one file per running session at
+//! `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`, rewritten on every status change.
+//! An agent supervisor knows its child's pid, so it reads exactly one of them.
+//!
+//! The format is private to Claude Code, so every field is optional and every
+//! failure degrades to "no opinion" — a status we can't read must leave the
+//! last known state standing rather than replace it with a guess.
+
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+
+/// Claude Code's own view of what a session is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Busy,
+    Shell,
+    Idle,
+    Waiting,
+}
+
+/// One session's registry record.
+#[derive(Debug, Clone, Default)]
+pub struct Record {
+    pub status: Option<Status>,
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Raw {
+    status: Option<String>,
+    session_id: Option<String>,
+}
+
+/// Where Claude Code keeps its per-session status files. Mirrors Claude Code's
+/// own rule, so a non-default config dir doesn't silently strand us.
+pub fn registry_dir() -> Option<PathBuf> {
+    match std::env::var("CLAUDE_CONFIG_DIR") {
+        Ok(d) if !d.is_empty() => Some(PathBuf::from(d).join("sessions")),
+        _ => std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".claude/sessions")),
+    }
+}
+
+/// Read one session's record. None = nothing usable there.
+pub fn read(dir: &Path, pid: i32) -> Option<Record> {
+    let body = std::fs::read_to_string(dir.join(format!("{pid}.json"))).ok()?;
+    let raw: Raw = serde_json::from_str(&body).ok()?;
+    Some(Record {
+        status: raw.status.as_deref().and_then(parse_status),
+        session_id: raw.session_id,
+    })
+}
+
+fn parse_status(s: &str) -> Option<Status> {
+    match s {
+        "busy" => Some(Status::Busy),
+        "shell" => Some(Status::Shell),
+        "idle" => Some(Status::Idle),
+        "waiting" => Some(Status::Waiting),
+        other => {
+            tracing::debug!(status = %other, "unrecognised claude session status");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(dir: &std::path::Path, pid: i32, body: &str) {
+        std::fs::write(dir.join(format!("{pid}.json")), body).unwrap();
+    }
+
+    #[test]
+    fn reads_the_status_for_our_pid() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), 42, r#"{"pid":42,"status":"busy","sessionId":"abc"}"#);
+        let r = read(d.path(), 42).unwrap();
+        assert_eq!(r.status, Some(Status::Busy));
+        assert_eq!(r.session_id.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn every_observed_status_parses() {
+        for (s, want) in [
+            ("busy", Status::Busy),
+            ("shell", Status::Shell),
+            ("idle", Status::Idle),
+            ("waiting", Status::Waiting),
+        ] {
+            let d = tempfile::tempdir().unwrap();
+            write(d.path(), 1, &format!(r#"{{"pid":1,"status":"{s}"}}"#));
+            assert_eq!(read(d.path(), 1).unwrap().status, Some(want));
+        }
+    }
+
+    #[test]
+    fn an_unknown_status_is_no_opinion_not_a_guess() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), 1, r#"{"pid":1,"status":"hibernating"}"#);
+        assert_eq!(read(d.path(), 1).unwrap().status, None);
+    }
+
+    #[test]
+    fn a_missing_or_unparseable_file_is_none() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(read(d.path(), 7).is_none());
+        write(d.path(), 8, "not json at all");
+        assert!(read(d.path(), 8).is_none());
+    }
+
+    #[test]
+    fn a_record_missing_every_optional_field_still_parses() {
+        // Upstream dropping a field must degrade, never error.
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), 9, r#"{"pid":9}"#);
+        let r = read(d.path(), 9).unwrap();
+        assert_eq!(r.status, None);
+        assert_eq!(r.session_id, None);
+    }
+}

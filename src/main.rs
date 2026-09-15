@@ -28,6 +28,15 @@ enum Command {
     },
     /// Show the human-involvement activity log and summary counts.
     Activity,
+    /// Internal: supervise an agent process and report its state.
+    Agent {
+        /// The task id whose session this agent belongs to.
+        #[arg(long)]
+        session: String,
+        /// The agent command, after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     /// Internal: called by Claude Code hooks to record a worker event.
     Hook {
         /// The event name (e.g. notification, stop, session-start).
@@ -80,6 +89,12 @@ fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Agent { session, command } => {
+            let id: kanban::model::TaskId = session.parse()
+                .map_err(|_| anyhow::anyhow!("invalid --session task id: {session}"))?;
+            let code = kanban::agent::supervise::run(&cli.root, id, &command)?;
+            std::process::exit(code);
+        }
         Command::Hook { event, session } => {
             use std::io::Read;
             let id: kanban::model::TaskId = session.parse()
@@ -91,13 +106,7 @@ fn main() -> anyhow::Result<()> {
             // backstop reconcile will pick the change up on its next pass.
             let changed = kanban::controller::events::record_state(&cli.root, id, &event, &buf)?;
             if changed {
-                // Ring the daemon's doorbell. Always resolve an address (recorded,
-                // else default) so a missing daemon.addr never silently disables the
-                // poke. If no daemon is up it fails harmlessly and the reconcile
-                // backstop covers it.
-                let addr = kanban::controller::server::daemon_addr(&cli.root);
-                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-                let _ = rt.block_on(kanban::controller::server::poke(&addr, id));
+                kanban::controller::server::poke_blocking(&cli.root, id);
             }
             Ok(())
         }

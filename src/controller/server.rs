@@ -58,6 +58,14 @@ pub fn daemon_addr(root: &Path) -> String {
     read_daemon_addr(root).unwrap_or_else(|| DEFAULT_ADDR.to_string())
 }
 
+/// Ring the doorbell from a short-lived process that has no runtime of its own.
+/// Swallows every failure: if no daemon is up, the backstop reconcile covers it.
+pub fn poke_blocking(root: &Path, id: TaskId) {
+    let addr = daemon_addr(root);
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+    let _ = rt.block_on(poke(&addr, id));
+}
+
 /// Best-effort doorbell: tell the daemon at `addr` to reconcile session `id`.
 /// Errors are the caller's to ignore — a failed poke degrades to the backstop.
 pub async fn poke(addr: &str, id: TaskId) -> anyhow::Result<()> {

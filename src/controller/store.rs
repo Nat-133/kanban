@@ -1,5 +1,7 @@
 use crate::model::*;
 use std::fs;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -298,9 +300,28 @@ pub fn load_all_tasks(root: &Path) -> anyhow::Result<Vec<Task>> {
 }
 
 /// The worker's current-state file. Single source of a session's live phase:
-/// the hook overwrites it with the latest tracked event; the controller only
-/// ever reads it. No history is kept here (see the activity log for that).
+/// the agent overwrites it with its latest state; the controller only ever
+/// reads it. No history is kept here (see the activity log for that).
 pub fn state_path(root: &Path, id: TaskId) -> PathBuf { session_dir(root, id).join("state.yaml") }
+
+/// The agent's liveness beat. A separate small file rather than a field on
+/// `session.yaml`, because it is rewritten every few seconds and must not churn
+/// the session record.
+pub fn heartbeat_path(root: &Path, id: TaskId) -> PathBuf {
+    session_dir(root, id).join("heartbeat")
+}
+
+/// Record that the agent was alive at `at`.
+pub fn write_heartbeat(root: &Path, id: TaskId, at: OffsetDateTime) -> anyhow::Result<()> {
+    atomic_write(&heartbeat_path(root, id), &at.format(&Rfc3339)?)
+}
+
+/// When the agent last reported itself alive. None = never, or the beat is
+/// unreadable — both of which the liveness sweep reads as "not running".
+pub fn read_heartbeat(root: &Path, id: TaskId) -> Option<OffsetDateTime> {
+    let raw = fs::read_to_string(heartbeat_path(root, id)).ok()?;
+    OffsetDateTime::parse(raw.trim(), &Rfc3339).ok()
+}
 
 /// Overwrite a session's state file with its latest worker event.
 pub fn save_state(root: &Path, id: TaskId, event: &WorkerEvent) -> anyhow::Result<()> {
@@ -415,6 +436,33 @@ mod tests {
         save_task(&root, &t).unwrap();
         // archived tasks stay in tasks/, so their ids are never reused.
         assert_eq!(next_task_id(&root).unwrap(), TaskId::new(3));
+    }
+
+    #[test]
+    fn heartbeat_round_trips_and_is_absent_before_any_beat() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        let id = TaskId::new(1);
+        assert!(read_heartbeat(&root, id).is_none());
+        let t = time::OffsetDateTime::now_utc();
+        write_heartbeat(&root, id, t).unwrap();
+        let got = read_heartbeat(&root, id).unwrap();
+        assert!((got - t).abs() < time::Duration::seconds(1));
+    }
+
+    #[test]
+    fn an_unreadable_heartbeat_is_absent_not_an_error() {
+        // A truncated or half-written beat must read as "no beat", which the
+        // liveness sweep already treats as dead — never as a parse failure that
+        // takes the sweep down with it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        init_workspace(&root).unwrap();
+        let id = TaskId::new(1);
+        std::fs::create_dir_all(session_dir(&root, id)).unwrap();
+        std::fs::write(heartbeat_path(&root, id), "not a timestamp").unwrap();
+        assert!(read_heartbeat(&root, id).is_none());
     }
 
     #[test]

@@ -199,6 +199,22 @@ pub fn prepare_session(
     // would be swallowed by the variadic `--add-dir <dirs...>` that follows.
     command.insert(3, initial_prompt(&work));
 
+    // Run the worker under the supervisor, not directly: an agent reports its own
+    // state, which means something has to be the worker's parent and outlive its
+    // status changes. Everything after `--` is the worker command untouched, so
+    // `worker_cmd_start` is the only thing that needs to know about the wrapper.
+    let mut supervised = vec![
+        exe.clone(),
+        "agent".to_string(),
+        "--root".to_string(),
+        root_abs.clone(),
+        "--session".to_string(),
+        id.to_string(),
+        "--".to_string(),
+    ];
+    supervised.extend(command);
+    let command = supervised;
+
     // workdir is always the agent's own sandbox, never the task's repo. Starting a
     // worker inside the shared checkout is what let two tasks commit over each
     // other and switch branches under each other; `spec.repo` now only says which
@@ -230,6 +246,20 @@ pub fn prepare_session(
 /// in an already-built command, so a resume can drop it.
 pub const INITIAL_PROMPT_PREFIX: &str = "Read the task handoff at ";
 
+/// Index of the worker binary within a stored launch command — the first entry
+/// past the supervisor's own `--` separator. Anything that rewrites the worker's
+/// arguments must position itself relative to this, or it hands them to the
+/// supervisor instead.
+///
+/// A command stored before the supervisor existed has no separator, so its
+/// worker binary sits at index 0.
+pub fn worker_cmd_start(command: &[String]) -> usize {
+    match command.iter().position(|a| a == "--") {
+        Some(sep) => sep + 1,
+        None => 0,
+    }
+}
+
 /// The first turn a freshly launched agent is given.
 pub fn initial_prompt(work: &Path) -> String {
     format!(
@@ -256,6 +286,9 @@ pub fn handoff(root: &Path, task_id: TaskId, worker_name: &str, launcher: &dyn L
     let session = prepare_session(root, &task, worker_name, worker, &cfg.agents.base_dirs, &context)?;
     let session_name = substitute(&worker.terminal.session_name, &task_id.to_string(), task.spec.repo.as_deref());
     launcher.launch(&session, &session_name)?;
+    // Beat on the agent's behalf: the supervisor beats as its first act, but the
+    // launch is asynchronous, and a session with no beat at all reads as dead.
+    store::write_heartbeat(root, task_id, time::OffsetDateTime::now_utc())?;
     store::save_session(root, &session)?;
     task.status.worker_session_ref = Some(session.metadata.name.clone());
     store::save_task(root, &task)?;
@@ -476,8 +509,9 @@ mod tests {
         let link = work.join("notes.md");
         assert!(std::fs::symlink_metadata(&link).is_ok(), "notes.md should be symlinked into work/");
         assert_eq!(std::fs::read_to_string(&link).unwrap(), "hi");
-        assert_eq!(session.spec.command.first().unwrap(), "claude");
-        assert!(session.spec.command.iter().any(|a| a.contains(&format!("sessions/{id}"))));
+        let cmd = &session.spec.command;
+        assert_eq!(cmd[worker_cmd_start(cmd)], "claude");
+        assert!(cmd.iter().any(|a| a.contains(&format!("sessions/{id}"))));
         assert_eq!(session.spec.task_ref, id);
         assert_eq!(session.metadata.name, format!("{id}-claude"));
         // no repo set -> workdir is the session dir, and it must be absolute so the
@@ -535,6 +569,34 @@ mod tests {
         // It must not be the final token: a trailing positional would be eaten by
         // the variadic `--add-dir <dirs...>` that precedes it.
         assert!(idx < cmd.len() - 1, "prompt must not be the last arg; cmd={cmd:?}");
+    }
+
+    #[test]
+    fn the_launch_command_runs_the_agent_supervisor() {
+        use crate::controller::store;
+        use crate::model::TaskId;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        let id = TaskId::new(1);
+        let task = sample_task(id, "x");
+        store::save_task(&root, &task).unwrap();
+        let cfg = store::load_config(&root).unwrap();
+        let ctx = crate::model::PermissionContext::builtin_default();
+        let session = prepare_session(&root, &task, "claude", cfg.workers.get("claude").unwrap(), &cfg.agents.base_dirs, &ctx).unwrap();
+
+        let cmd = &session.spec.command;
+        assert_eq!(cmd[1], "agent", "the supervisor runs claude, not the other way round");
+        assert!(cmd.contains(&"--session".to_string()));
+        // Everything after the separator is the worker command, untouched.
+        assert_eq!(cmd[worker_cmd_start(cmd)], "claude");
+    }
+
+    #[test]
+    fn worker_cmd_start_falls_back_for_an_unwrapped_command() {
+        // A command stored before the supervisor existed has no separator, so its
+        // worker binary is still at index 0.
+        assert_eq!(worker_cmd_start(&["claude".to_string(), "--settings".to_string()]), 0);
     }
 
     #[test]

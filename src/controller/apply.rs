@@ -224,10 +224,12 @@ fn continue_transcript(command: &mut Vec<String>, session_id: String) {
             None => command.push(session_id),
         },
         // Right after the worker binary: the trailing positional prompt must stay
-        // non-leading, and the variadic `--add-dir` must stay last.
+        // non-leading, and the variadic `--add-dir` must stay last. The worker is
+        // not at index 0 — it runs under the supervisor, past its `--`.
         None => {
-            command.insert(1, session_id);
-            command.insert(1, "--resume".to_string());
+            let at = handoff::worker_cmd_start(command) + 1;
+            command.insert(at, session_id);
+            command.insert(at, "--resume".to_string());
         }
     }
 }
@@ -336,6 +338,9 @@ fn resume(root: &Path, task_id: TaskId, launcher: &dyn handoff::Launcher) -> any
     }
     session.spec.command = command;
     launcher.launch(&session, &session_name)?;
+    // Beat on the agent's behalf, as handoff does: without one the liveness sweep
+    // would find the session we just revived stale and mark it interrupted again.
+    store::write_heartbeat(root, task_id, time::OffsetDateTime::now_utc())?;
     store::save_session(root, &session)?;
     // Assert the relaunched state immediately rather than waiting for the
     // agent's SessionStart hook, so the board reflects the resume at once.
@@ -773,6 +778,23 @@ mod tests {
     /// The seeded first turn, recognised the way `continue_transcript` does.
     fn has_handoff_prompt(cmd: &[String]) -> bool {
         cmd.iter().any(|a| a.starts_with(handoff::INITIAL_PROMPT_PREFIX))
+    }
+
+    #[test]
+    fn resume_injects_into_the_worker_command_not_the_supervisor() {
+        // The command now starts with `kanban agent … --`, so an insert at index 1
+        // would hand `--resume` to the supervisor and leave claude none the wiser.
+        let d = setup(); let r = root(&d);
+        let id = interrupted_task(&r);
+        let launcher = DeadLauncher::default();
+
+        resume(&r, id, &launcher).unwrap();
+
+        let cmds = launcher.launched.lock().unwrap();
+        let cmd = &cmds[0];
+        let at = cmd.iter().position(|a| a == "--resume").expect("--resume present");
+        assert!(at > handoff::worker_cmd_start(cmd),
+            "--resume must land inside the worker's args: {cmd:?}");
     }
 
     #[test]

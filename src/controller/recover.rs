@@ -87,7 +87,7 @@ mod tests {
         apply(&root, Intent::CreateTask { text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
         let id = TaskId::new(1);
         handoff::handoff(&root, id, "claude", &Alive).unwrap();
-        events::record_state(&root, id, "user-prompt-submit", "{}").unwrap();
+        store::set_state_for_test(&root, id, WorkerEventKind::Working);
         events::ingest_session(&root, id).unwrap();
         (dir, root, id)
     }
@@ -132,7 +132,7 @@ mod tests {
         // The human exited deliberately; its terminal session is gone by design.
         // The probe must not drag a finished ticket back out of `done`.
         let (_d, root, id) = working_session();
-        events::record_state(&root, id, "session-end", "{\"reason\":\"prompt_input_exit\"}").unwrap();
+        store::set_state_for_test(&root, id, WorkerEventKind::Completed);
         events::ingest_session(&root, id).unwrap();
 
         assert!(!reconcile_liveness(&root, &Dead).unwrap());

@@ -395,7 +395,7 @@ fn archive(root: &Path, task_id: TaskId, launcher: &dyn handoff::Launcher) -> an
 ///
 /// The profile update is the durable state change; the `ProfileChanged` fact is
 /// observability, so its append is best-effort (warned and swallowed on failure),
-/// consistent with the human-involvement facts emitted in `events::record_state`.
+/// consistent with the human-involvement facts emitted in `events::record_hook`.
 fn set_profile(root: &Path, task_id: TaskId, profile: String) -> anyhow::Result<Response> {
     if !store::task_dir(root, task_id).exists() {
         return Ok(Response::Error { message: format!("task not found: {task_id}") });
@@ -510,7 +510,8 @@ mod tests {
         let dir = setup(); let r = root(&dir);
         apply(&r, Intent::CreateTask { text: "A\n\ns".into(), column: col("todo") }).unwrap();
         crate::controller::handoff::handoff(&r, TaskId::new(1), "claude", &NoLaunch).unwrap();
-        crate::controller::events::record_state(&r, TaskId::new(1), "notification", "{\"notification_type\":\"permission_prompt\"}").unwrap();
+        store::set_state_for_test(&r, TaskId::new(1),
+            WorkerEventKind::HumanInputRequired(crate::model::Notification::PermissionPrompt));
         crate::controller::events::ingest_session(&r, TaskId::new(1)).unwrap();
         match apply(&r, Intent::GetBoard).unwrap() {
             Response::Snapshot { sessions, .. } => {
@@ -747,8 +748,8 @@ mod tests {
         apply(r, Intent::CreateTask { text: "A".into(), column: col("todo") }).unwrap();
         let id = TaskId::new(1);
         handoff::handoff(r, id, "claude", &NoLaunch).unwrap();
-        crate::controller::events::record_state(r, id, "session-start", "{\"session_id\":\"abc-123\"}").unwrap();
-        crate::controller::events::record_state(r, id, "session-end", "{\"reason\":\"other\"}").unwrap();
+        crate::controller::events::record_hook(r, id, "session-start", "{\"session_id\":\"abc-123\"}").unwrap();
+        store::set_state_for_test(r, id, WorkerEventKind::Interrupted);
         crate::controller::events::ingest_session(r, id).unwrap();
         id
     }
@@ -815,7 +816,7 @@ mod tests {
         apply(&r, Intent::CreateTask { text: "A".into(), column: col("todo") }).unwrap();
         let id = TaskId::new(1);
         handoff::handoff(&r, id, "claude", &NoLaunch).unwrap();
-        crate::controller::events::record_state(&r, id, "session-end", "{\"reason\":\"other\"}").unwrap();
+        store::set_state_for_test(&r, id, WorkerEventKind::Interrupted);
         let launcher = DeadLauncher::default();
 
         resume(&r, id, &launcher).unwrap();
@@ -859,8 +860,8 @@ mod tests {
         let id = interrupted_task(&r);
         let launcher = DeadLauncher::default();
         resume(&r, id, &launcher).unwrap();
-        crate::controller::events::record_state(&r, id, "session-start", "{\"session_id\":\"def-456\"}").unwrap();
-        crate::controller::events::record_state(&r, id, "session-end", "{\"reason\":\"other\"}").unwrap();
+        crate::controller::events::record_hook(&r, id, "session-start", "{\"session_id\":\"def-456\"}").unwrap();
+        store::set_state_for_test(&r, id, WorkerEventKind::Interrupted);
 
         resume(&r, id, &launcher).unwrap();
 
@@ -948,7 +949,7 @@ mod tests {
         apply(r, Intent::CreateTask { text: "A".into(), column: col("todo") }).unwrap();
         let id = TaskId::new(1);
         handoff::handoff(r, id, "claude", &NoLaunch).unwrap();
-        crate::controller::events::record_state(r, id, "session-start", "{\"session_id\":\"abc-123\"}").unwrap();
+        crate::controller::events::record_hook(r, id, "session-start", "{\"session_id\":\"abc-123\"}").unwrap();
         id
     }
 
@@ -990,7 +991,7 @@ mod tests {
         rehandoff(&r, id, &LiveLauncher::default()).unwrap();
 
         let text = std::fs::read_to_string(&settings).unwrap();
-        assert!(text.contains("SubagentStop"), "settings must be rewritten: {text}");
+        assert!(text.contains("SessionEnd"), "settings must be rewritten: {text}");
     }
 
     #[test]
@@ -1043,7 +1044,7 @@ mod tests {
         apply(&r, Intent::CreateTask { text: "A".into(), column: col("todo") }).unwrap();
         let id = TaskId::new(1);
         handoff::handoff(&r, id, "claude", &NoLaunch).unwrap();
-        crate::controller::events::record_state(&r, id, "session-end", "{\"reason\":\"other\"}").unwrap();
+        store::set_state_for_test(&r, id, WorkerEventKind::Interrupted);
         let launcher = DeadLauncher::default();
 
         resume(&r, id, &launcher).unwrap();

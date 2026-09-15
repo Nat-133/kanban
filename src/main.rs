@@ -101,14 +101,10 @@ fn main() -> anyhow::Result<()> {
                 .map_err(|_| anyhow::anyhow!("invalid --session task id: {session}"))?;
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf).ok();
-            // Write the durable state first; only ring the daemon's doorbell if this
-            // firing actually changed the state. A failed poke is fine — the daemon's
-            // backstop reconcile will pick the change up on its next pass.
-            let changed = kanban::controller::events::record_state(&cli.root, id, &event, &buf)?;
-            if changed {
-                kanban::controller::server::poke_blocking(&cli.root, id);
-            }
-            Ok(())
+            // No doorbell: the agent owns state and pokes when it changes. A hook
+            // only records the activity log and the session metadata, neither of
+            // which the board renders.
+            kanban::controller::events::record_hook(&cli.root, id, &event, &buf)
         }
     }
 }

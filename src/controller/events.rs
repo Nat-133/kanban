@@ -1,73 +1,15 @@
 use crate::controller::activity::{self, ActivityKind, InterruptionReason};
-use crate::controller::background;
 use crate::controller::store;
-use crate::model::{Notification, Phase, TaskId, WorkerEvent, WorkerEventKind};
+use crate::model::{Phase, TaskId, WorkerEvent};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// One captured hook event. `payload` is Claude's raw event JSON. Used only as an
-/// in-memory parse target while mapping a hook firing to a worker event; it is
-/// never persisted (the session's `state.yaml` holds the mapped event instead).
+/// One captured hook event. `payload` is Claude's raw event JSON. Used only as
+/// an in-memory parse target while reading a firing; it is never persisted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntakePayload {
     pub event: String,
     pub payload: serde_json::Value,
-}
-
-/// Map a captured hook firing to a worker event. None = not tracked (e.g. a
-/// non-permission/idle Notification like auth_success), in which case the
-/// session's state is left untouched.
-///
-/// `background_pending` is whether the session has a spawned subagent that has
-/// not reported back, which changes what a Stop means.
-fn to_event(item: &IntakePayload, background_pending: bool) -> Option<WorkerEvent> {
-    let kind = match item.event.as_str() {
-        // A resumed session is handed no prompt — its transcript already holds the
-        // handoff — so it comes up sitting at the prompt waiting for the human,
-        // not working. Any other start (fresh launch, /clear) is seeded with a
-        // turn and really is working.
-        "session-start" => match item.payload.get("source").and_then(|v| v.as_str()) {
-            Some("resume") => WorkerEventKind::HumanInputRequired(Notification::IdlePrompt),
-            _ => WorkerEventKind::Started,
-        },
-        "user-prompt-submit" => WorkerEventKind::Working,
-        // Stop fires when claude finishes its turn and hands control back to the
-        // human — it is waiting for a response, not working. Treat it as idle so
-        // the card flips to the warning, not the spinner.
-        //
-        // Unless a subagent is still running: Stop also fires when claude yields
-        // the turn to wait on background work, and the agent will be re-invoked
-        // when that reports back. Nobody is waiting on the human, so the card must
-        // keep the spinner.
-        "stop" if background_pending => WorkerEventKind::Working,
-        "stop" => WorkerEventKind::HumanInputRequired(Notification::IdlePrompt),
-        // SessionEnd fires on ANY teardown — a deliberate exit, a `/clear`, a
-        // logout, or the terminal dying under the agent at laptop shutdown. Only
-        // the human closing the session by hand means the work is finished, so we
-        // key on `reason` and default everything else to interrupted: an
-        // unrecognised (or future) reason must never complete a ticket.
-        "session-end" => match item.payload.get("reason").and_then(|v| v.as_str()) {
-            Some("prompt_input_exit") => WorkerEventKind::Completed,
-            // `clear` is not an ending at all: the agent keeps running in the same
-            // terminal session and a SessionStart follows. Leave the state alone,
-            // so the card neither moves nor offers a resume for a live agent.
-            Some("clear") => return None,
-            _ => WorkerEventKind::Interrupted,
-        },
-        "stop-failure" => WorkerEventKind::Failed,
-        "notification" => match item.payload.get("notification_type").and_then(|v| v.as_str()) {
-            Some("permission_prompt") => WorkerEventKind::HumanInputRequired(Notification::PermissionPrompt),
-            Some("idle_prompt") => WorkerEventKind::HumanInputRequired(Notification::IdlePrompt),
-            _ => return None,
-        },
-        _ => return None,
-    };
-    Some(WorkerEvent {
-        kind,
-        source: "claude-code-hook".to_string(),
-        observed_at: time::OffsetDateTime::now_utc(),
-        payload_ref: None,
-    })
 }
 
 /// Map a captured hook firing to a human-involvement activity fact. None = the
@@ -75,13 +17,16 @@ fn to_event(item: &IntakePayload, background_pending: bool) -> Option<WorkerEven
 /// Steers and interruptions are the observability signals we fold into
 /// context-switch metrics; everything else (session lifecycle, non-blocking
 /// notifications like auth_success) yields None.
-fn to_activity(item: &IntakePayload, background_pending: bool) -> Option<ActivityKind> {
+///
+/// `agent_busy` is whether Claude Code reports the session as busy, which for a
+/// Stop means it yielded the turn to a subagent rather than to the human.
+fn to_activity(item: &IntakePayload, agent_busy: bool) -> Option<ActivityKind> {
     match item.event.as_str() {
         "user-prompt-submit" => Some(ActivityKind::Steer),
         // A stop that only yields to a running subagent costs the human nothing, so
         // counting it would inflate interruptions-per-task with work the agent did
         // unattended.
-        "stop" if background_pending => None,
+        "stop" if agent_busy => None,
         "stop" => Some(ActivityKind::Interruption { reason: InterruptionReason::Idle }),
         "notification" => match item.payload.get("notification_type").and_then(|v| v.as_str()) {
             Some("permission_prompt") => {
@@ -94,28 +39,20 @@ fn to_activity(item: &IntakePayload, background_pending: bool) -> Option<Activit
     }
 }
 
-/// Record a hook firing into the session's state file, overwriting the previous
-/// state. `raw_payload` is Claude's stdin JSON (treated as a bare string if not
-/// valid JSON). Returns true when the event was tracked and the state changed —
-/// the caller uses this to decide whether to wake the controller. Untracked
-/// firings leave the existing state in place and return false.
-pub fn record_state(root: &Path, id: TaskId, event: &str, raw_payload: &str) -> anyhow::Result<bool> {
+/// Record what a hook firing tells us. The agent reports its own state, so this
+/// no longer touches `state.yaml`: it appends the human-involvement activity
+/// fact and captures the session metadata only the hook payload carries.
+///
+/// `raw_payload` is Claude's stdin JSON (treated as a bare string if not valid
+/// JSON).
+pub fn record_hook(root: &Path, id: TaskId, event: &str, raw_payload: &str) -> anyhow::Result<()> {
     let payload: serde_json::Value = serde_json::from_str(raw_payload)
         .unwrap_or_else(|_| serde_json::Value::String(raw_payload.to_string()));
     let item = IntakePayload { event: event.to_string(), payload };
-    // Subagent bookkeeping first, so a firing that both mutates and reads the
-    // pending set (a prompt or session start clearing it) sees its own effect.
-    match item.event.as_str() {
-        "pre-tool-use" => background::started(root, id)?,
-        "subagent-stop" => background::finished(root, id)?,
-        "user-prompt-submit" | "session-start" => background::clear(root, id)?,
-        _ => {}
-    }
-    let background_pending = background::pending(root, id);
+    let agent_busy = agent_is_busy(&item.payload);
     // Best-effort activity fact: a human-involvement firing (steer/interruption)
-    // is ALSO appended to the root activity log. This must never break state
-    // recording, so any failure is warned and swallowed.
-    if let Some(kind) = to_activity(&item, background_pending) {
+    // is appended to the root activity log. Any failure is warned and swallowed.
+    if let Some(kind) = to_activity(&item, agent_busy) {
         let profile = store::load_task(root, id)
             .ok()
             .and_then(|t| t.spec.profile)
@@ -131,25 +68,31 @@ pub fn record_state(root: &Path, id: TaskId, event: &str, raw_payload: &str) -> 
         }
     }
     // Best-effort session metadata capture (session_id on start; transcript copy
-    // on end). Must never break state recording, so any failure is warned and
-    // swallowed and never touches record_state's return value.
+    // on end). A failure here must not lose the activity fact above, so it is
+    // warned and swallowed.
     if let Err(e) = capture_session_metadata(root, id, &item.event, &item.payload) {
         tracing::warn!(error = %e, "failed to capture session metadata");
     }
-    match to_event(&item, background_pending) {
-        Some(ev) => {
-            store::save_state(root, id, &ev)?;
-            Ok(true)
-        }
-        None => Ok(false),
-    }
+    Ok(())
+}
+
+/// Whether Claude Code currently reports this session as busy, looked up by the
+/// `session_id` its hook payload carries.
+///
+/// Unknown counts as not busy: over-counting an interruption is a smaller lie
+/// than dropping a real one, and this only ever suppresses a fact.
+fn agent_is_busy(payload: &serde_json::Value) -> bool {
+    use crate::agent::registry::{find_by_session_id, registry_dir, Status};
+    let Some(sid) = payload.get("session_id").and_then(|v| v.as_str()) else { return false };
+    let Some(dir) = registry_dir() else { return false };
+    find_by_session_id(&dir, sid).and_then(|r| r.status) == Some(Status::Busy)
 }
 
 /// Capture Claude Code hook metadata into the session record: the `session_id`
 /// (seeds a future resume) and, on `session-end`, a copy of the transcript into
 /// the session dir (Claude GCs the original after ~30 days, so we preserve it
-/// where Task 10's archive keeps it). Best-effort: a missing session or an
-/// unreadable transcript is not an error — the hook must still record state.
+/// where the archive keeps it). Best-effort: a missing session or an unreadable
+/// transcript is not an error.
 fn capture_session_metadata(
     root: &Path,
     id: TaskId,
@@ -272,193 +215,18 @@ pub fn reconcile_all(root: &Path) -> anyhow::Result<bool> {
     Ok(any)
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::TaskId;
+    use crate::model::{Notification, TaskId, WorkerEventKind};
 
-    #[test]
-    fn record_state_writes_mapped_event_for_tracked_firing() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".kanban");
-        crate::controller::store::init_workspace(&root).unwrap();
-        let id = TaskId::new(1);
-
-        let tracked = record_state(&root, id, "notification", "{\"notification_type\":\"permission_prompt\"}").unwrap();
-        assert!(tracked);
-        let state = store::load_state(&root, id).unwrap().unwrap();
-        assert_eq!(state.kind, WorkerEventKind::HumanInputRequired(Notification::PermissionPrompt));
-    }
-
-    #[test]
-    fn record_state_overwrites_previous_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".kanban");
-        store::init_workspace(&root).unwrap();
-        let id = TaskId::new(1);
-        record_state(&root, id, "session-start", "{}").unwrap();
-        record_state(&root, id, "notification", "{\"notification_type\":\"idle_prompt\"}").unwrap();
-        // only the latest tracked event is retained
-        let state = store::load_state(&root, id).unwrap().unwrap();
-        assert_eq!(state.kind, WorkerEventKind::HumanInputRequired(Notification::IdlePrompt));
-    }
-
-    #[test]
-    fn record_state_ignores_untracked_firing_and_keeps_prior_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".kanban");
-        store::init_workspace(&root).unwrap();
-        let id = TaskId::new(1);
-        record_state(&root, id, "user-prompt-submit", "{}").unwrap(); // Working
-        let tracked = record_state(&root, id, "notification", "{\"notification_type\":\"auth_success\"}").unwrap();
-        assert!(!tracked); // untracked -> caller should not wake
-        // prior Working state must survive an untracked firing
-        assert_eq!(store::load_state(&root, id).unwrap().unwrap().kind, WorkerEventKind::Working);
-    }
-
-    #[test]
-    fn permission_prompt_appends_interruption_activity() {
-        use crate::controller::{activity, apply::apply};
-        use crate::model::proto::Intent;
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".kanban");
-        store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { text: "A".into(),
-            column: "todo".parse().unwrap() }).unwrap();
-        let id = TaskId::new(1);
-
-        record_state(&root, id, "notification",
-            "{\"notification_type\":\"permission_prompt\"}").unwrap();
-
-        let acts = activity::load(&root).unwrap();
-        assert_eq!(acts.len(), 1);
-        assert_eq!(acts[0].task, id);
-        assert!(matches!(acts[0].kind,
-            activity::ActivityKind::Interruption {
-                reason: activity::InterruptionReason::PermissionPrompt }));
-    }
-
-    #[test]
-    fn untracked_firing_appends_no_activity() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".kanban");
-        store::init_workspace(&root).unwrap();
-        record_state(&root, TaskId::new(1), "notification",
-            "{\"notification_type\":\"auth_success\"}").unwrap();
-        assert!(crate::controller::activity::load(&root).unwrap().is_empty());
-    }
-
-    #[test]
-    fn ingest_permission_prompt_keeps_card_in_doing() {
-        use crate::controller::apply::apply;
-        use crate::model::proto::Intent;
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".kanban");
-        store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
-        let id = TaskId::new(1);
-        record_state(&root, id, "notification", "{\"notification_type\":\"permission_prompt\"}").unwrap();
-
-        let changed = ingest_session(&root, id).unwrap();
-        assert!(changed);
-        // needs-human is an in-progress state -> stays in doing; the warning icon
-        // (not the column) signals it needs attention.
-        let board = store::load_board(&root).unwrap();
-        assert!(board.cards().get(&"doing".parse().unwrap()).unwrap().contains(&id));
-    }
-
-    #[test]
-    fn stop_marks_session_as_needing_human_not_working() {
-        use crate::controller::apply::apply;
-        use crate::model::proto::Intent;
-        use crate::model::Phase;
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".kanban");
-        store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
-        let id = TaskId::new(1);
-        // claude finished its turn and handed control back -> it needs the human,
-        // it is NOT working, so no spinner.
-        record_state(&root, id, "stop", "{}").unwrap();
-        assert_eq!(session_phase(&root, id).unwrap(), Phase::Idle);
-        assert!(session_phase(&root, id).unwrap().needs_human_input());
-        ingest_session(&root, id).unwrap();
-        let board = store::load_board(&root).unwrap();
-        // in-progress (needs human) -> stays in doing; the warning icon shows it's waiting.
-        assert!(board.cards().get(&"doing".parse().unwrap()).unwrap().contains(&id));
-    }
-
-    #[test]
-    fn a_resumed_session_start_is_idle_not_working() {
-        let (_d, root, id) = workspace_with_task();
-        record_state(&root, id, "session-start", "{\"source\":\"resume\"}").unwrap();
-        assert_eq!(session_phase(&root, id).unwrap(), Phase::Idle);
-    }
-
-    #[test]
-    fn a_fresh_session_start_is_working() {
-        let (_d, root, id) = workspace_with_task();
-        record_state(&root, id, "session-start", "{\"source\":\"startup\"}").unwrap();
-        assert_eq!(session_phase(&root, id).unwrap(), Phase::Working);
-    }
-
-    #[test]
-    fn stop_while_a_subagent_runs_stays_working() {
-        let (_d, root, id) = workspace_with_task();
-        record_state(&root, id, "pre-tool-use", "{}").unwrap();
-        record_state(&root, id, "stop", "{}").unwrap();
-        assert_eq!(session_phase(&root, id).unwrap(), Phase::Working);
-        assert!(!session_phase(&root, id).unwrap().needs_human_input());
-        assert!(
-            crate::controller::activity::load(&root).unwrap().is_empty(),
-            "yielding to a subagent is not a human interruption"
-        );
-    }
-
-    #[test]
-    fn stop_after_the_last_subagent_finishes_needs_the_human() {
-        let (_d, root, id) = workspace_with_task();
-        record_state(&root, id, "pre-tool-use", "{}").unwrap();
-        record_state(&root, id, "subagent-stop", "{}").unwrap();
-        record_state(&root, id, "stop", "{}").unwrap();
-        assert_eq!(session_phase(&root, id).unwrap(), Phase::Idle);
-    }
-
-    #[test]
-    fn stop_while_one_of_two_subagents_still_runs_stays_working() {
-        let (_d, root, id) = workspace_with_task();
-        record_state(&root, id, "pre-tool-use", "{}").unwrap();
-        record_state(&root, id, "pre-tool-use", "{}").unwrap();
-        record_state(&root, id, "subagent-stop", "{}").unwrap();
-        record_state(&root, id, "stop", "{}").unwrap();
-        assert_eq!(session_phase(&root, id).unwrap(), Phase::Working);
-    }
-
-    #[test]
-    fn a_new_prompt_clears_leaked_subagents() {
-        let (_d, root, id) = workspace_with_task();
-        // a subagent that died without ever reporting back
-        record_state(&root, id, "pre-tool-use", "{}").unwrap();
-        record_state(&root, id, "user-prompt-submit", "{}").unwrap();
-        record_state(&root, id, "stop", "{}").unwrap();
-        assert_eq!(session_phase(&root, id).unwrap(), Phase::Idle);
-    }
-
-    #[test]
-    fn subagent_bookkeeping_firings_are_untracked() {
-        let (_d, root, id) = workspace_with_task();
-        assert!(!record_state(&root, id, "pre-tool-use", "{}").unwrap());
-        assert!(!record_state(&root, id, "subagent-stop", "{}").unwrap());
-        assert_eq!(session_phase(&root, id).unwrap(), Phase::Pending, "no state written");
-    }
-
-    #[test]
-    fn an_idle_notification_overrides_a_leaked_subagent() {
-        let (_d, root, id) = workspace_with_task();
-        record_state(&root, id, "pre-tool-use", "{}").unwrap();
-        record_state(&root, id, "stop", "{}").unwrap();
-        record_state(&root, id, "notification", "{\"notification_type\":\"idle_prompt\"}").unwrap();
-        assert!(session_phase(&root, id).unwrap().needs_human_input());
+    /// A launcher that pretends every session starts and stays alive.
+    struct NoLaunch;
+    impl crate::controller::handoff::Launcher for NoLaunch {
+        fn launch(&self, _s: &crate::model::WorkerSession, _n: &str) -> anyhow::Result<()> { Ok(()) }
+        fn kill(&self, _n: &str) {}
+        fn is_alive(&self, _n: &str) -> bool { true }
     }
 
     /// Create task 1 in `todo` in a fresh workspace.
@@ -472,167 +240,154 @@ mod tests {
         (dir, root, TaskId::new(1))
     }
 
+    /// As above, but handed off so `session.yaml` exists.
+    fn workspace_with_session() -> (tempfile::TempDir, std::path::PathBuf, TaskId) {
+        let (dir, root, id) = workspace_with_task();
+        crate::controller::handoff::handoff(&root, id, "claude", &NoLaunch).unwrap();
+        (dir, root, id)
+    }
+
     fn column_of(root: &Path, id: TaskId) -> Option<String> {
         let board = store::load_board(root).unwrap();
         board.cards().iter().find(|(_, v)| v.contains(&id)).map(|(c, _)| c.to_string())
     }
 
     #[test]
-    fn deliberate_exit_moves_to_done() {
+    fn a_hook_firing_does_not_write_worker_state() {
+        // The agent owns its own state. A hook records activity and metadata only,
+        // so two writers can't fight over the same file.
         let (_d, root, id) = workspace_with_task();
-        // The human ran `exit` / Ctrl-D: the only signal that means "finished".
-        record_state(&root, id, "session-end", "{\"reason\":\"prompt_input_exit\"}").unwrap();
+        record_hook(&root, id, "stop", "{}").unwrap();
+        record_hook(&root, id, "notification", "{\"notification_type\":\"permission_prompt\"}").unwrap();
+        record_hook(&root, id, "session-end", "{\"reason\":\"prompt_input_exit\"}").unwrap();
+        assert!(store::load_state(&root, id).unwrap().is_none());
+    }
+
+    #[test]
+    fn hooks_still_record_the_activity_log() {
+        let (_d, root, id) = workspace_with_task();
+        record_hook(&root, id, "user-prompt-submit", "{}").unwrap();
+        record_hook(&root, id, "notification", "{\"notification_type\":\"permission_prompt\"}").unwrap();
+        record_hook(&root, id, "stop", "{}").unwrap();
+        let acts = activity::load(&root).unwrap();
+        assert_eq!(acts.len(), 3);
+        assert!(matches!(acts[0].kind, ActivityKind::Steer));
+        assert!(matches!(acts[1].kind,
+            ActivityKind::Interruption { reason: InterruptionReason::PermissionPrompt }));
+        assert!(matches!(acts[2].kind,
+            ActivityKind::Interruption { reason: InterruptionReason::Idle }));
+    }
+
+    #[test]
+    fn permission_prompt_appends_interruption_activity() {
+        let (_d, root, id) = workspace_with_task();
+        record_hook(&root, id, "notification", "{\"notification_type\":\"permission_prompt\"}").unwrap();
+        let acts = activity::load(&root).unwrap();
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0].task, id);
+        assert!(matches!(acts[0].kind,
+            ActivityKind::Interruption { reason: InterruptionReason::PermissionPrompt }));
+    }
+
+    #[test]
+    fn a_non_involvement_notification_appends_no_activity() {
+        let (_d, root, id) = workspace_with_task();
+        record_hook(&root, id, "notification", "{\"notification_type\":\"auth_success\"}").unwrap();
+        assert!(activity::load(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ingest_needs_human_keeps_card_in_doing() {
+        let (_d, root, id) = workspace_with_task();
+        store::set_state_for_test(&root, id,
+            WorkerEventKind::HumanInputRequired(Notification::PermissionPrompt));
+
+        assert!(ingest_session(&root, id).unwrap());
+        // needs-human is an in-progress state -> stays in doing; the warning icon
+        // (not the column) signals it needs attention.
+        assert_eq!(column_of(&root, id).as_deref(), Some("doing"));
+    }
+
+    #[test]
+    fn ingest_completed_advances_to_done() {
+        let (_d, root, id) = workspace_with_task();
+        store::set_state_for_test(&root, id, WorkerEventKind::Completed);
         ingest_session(&root, id).unwrap();
         assert_eq!(column_of(&root, id).as_deref(), Some("done"));
     }
 
     #[test]
-    fn session_end_without_deliberate_exit_is_interrupted_and_stays_in_doing() {
-        // The shutdown case: the session was torn down under the agent. This must
-        // never read as completed work.
-        for reason in ["\"other\"", "\"logout\"", "\"some_future_reason\"", "null"] {
-            let (_d, root, id) = workspace_with_task();
-            record_state(&root, id, "user-prompt-submit", "{}").unwrap(); // Working
-            ingest_session(&root, id).unwrap();
-
-            record_state(&root, id, "session-end", &format!("{{\"reason\":{reason}}}")).unwrap();
-            ingest_session(&root, id).unwrap();
-
-            assert_eq!(session_phase(&root, id).unwrap(), Phase::Interrupted, "reason {reason}");
-            assert_eq!(column_of(&root, id).as_deref(), Some("doing"), "reason {reason}");
-        }
-    }
-
-    #[test]
-    fn session_end_with_no_reason_at_all_is_interrupted() {
-        // A hook firing with no reason field is indistinguishable from a crash.
+    fn ingest_interrupted_stays_in_doing() {
+        // Unfinished work must never read as finished.
         let (_d, root, id) = workspace_with_task();
-        record_state(&root, id, "session-end", "{}").unwrap();
-        assert_eq!(session_phase(&root, id).unwrap(), Phase::Interrupted);
+        store::set_state_for_test(&root, id, WorkerEventKind::Interrupted);
         ingest_session(&root, id).unwrap();
         assert_eq!(column_of(&root, id).as_deref(), Some("doing"));
     }
 
     #[test]
-    fn clear_is_not_an_ending_and_leaves_state_untouched() {
-        // `clear` fires SessionEnd but the agent keeps running in the same tmux
-        // session, with a SessionStart to follow. Neither move nor mark the card.
-        let (_d, root, id) = workspace_with_task();
-        record_state(&root, id, "user-prompt-submit", "{}").unwrap(); // Working
-
-        let tracked = record_state(&root, id, "session-end", "{\"reason\":\"clear\"}").unwrap();
-
-        assert!(!tracked, "clear must not wake the controller");
-        assert_eq!(store::load_state(&root, id).unwrap().unwrap().kind, WorkerEventKind::Working);
-        assert_eq!(session_phase(&root, id).unwrap(), Phase::Working);
-    }
-
-    #[test]
     fn ingest_is_idempotent_once_card_is_placed() {
-        use crate::controller::apply::apply;
-        use crate::model::proto::Intent;
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".kanban");
-        store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
-        let id = TaskId::new(1);
-        record_state(&root, id, "notification", "{\"notification_type\":\"idle_prompt\"}").unwrap();
+        let (_d, root, id) = workspace_with_task();
+        store::set_state_for_test(&root, id,
+            WorkerEventKind::HumanInputRequired(Notification::IdlePrompt));
         assert!(ingest_session(&root, id).unwrap()); // first move reports change
-        assert!(!ingest_session(&root, id).unwrap()); // already placed -> no change, no broadcast
+        assert!(!ingest_session(&root, id).unwrap()); // already placed -> no broadcast
     }
 
     #[test]
     fn ingest_does_not_resurrect_archived_task() {
-        use crate::controller::apply::apply;
-        use crate::model::proto::Intent;
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".kanban");
-        store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
-        let id = TaskId::new(1);
+        let (_d, root, id) = workspace_with_task();
         let mut task = store::load_task(&root, id).unwrap();
         task.status.archived = true;
         store::save_task(&root, &task).unwrap();
-        // a 'session-start' event would normally move the card to 'doing'…
-        record_state(&root, id, "session-start", "{}").unwrap();
+        store::set_state_for_test(&root, id, WorkerEventKind::Working);
+
         ingest_session(&root, id).unwrap();
-        // …but an archived task must not be placed on the board.
+
         let board = store::load_board(&root).unwrap();
         assert!(!board.cards().get(&"doing".parse().unwrap()).unwrap().contains(&id));
     }
 
     #[test]
     fn ingest_no_state_is_noop() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".kanban");
-        store::init_workspace(&root).unwrap();
-        crate::controller::apply::apply(&root, crate::model::proto::Intent::CreateTask {
-            text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
+        let (_d, root, id) = workspace_with_task();
         // a created-but-not-yet-handed-off task has no state file -> Pending -> no move
-        assert!(!ingest_session(&root, TaskId::new(1)).unwrap());
+        assert!(!ingest_session(&root, id).unwrap());
     }
 
     #[test]
     fn session_phase_is_pending_without_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".kanban");
-        store::init_workspace(&root).unwrap();
-        assert_eq!(session_phase(&root, TaskId::new(1)).unwrap(), Phase::Pending);
+        let (_d, root, id) = workspace_with_task();
+        assert_eq!(session_phase(&root, id).unwrap(), Phase::Pending);
     }
 
     #[test]
     fn fingerprint_changes_on_phase_change_without_column_move() {
-        use crate::controller::{apply::apply, handoff};
-        use crate::model::proto::Intent;
-        struct NoLaunch;
-        impl handoff::Launcher for NoLaunch {
-            fn launch(&self, _s: &crate::model::WorkerSession, _n: &str) -> anyhow::Result<()> { Ok(()) }
-            fn kill(&self, _n: &str) {}
-            fn is_alive(&self, _n: &str) -> bool { true }
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".kanban");
-        store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
-        let id = TaskId::new(1);
-        handoff::handoff(&root, id, "claude", &NoLaunch).unwrap(); // writes session.yaml
+        let (_d, root, id) = workspace_with_session();
 
-        record_state(&root, id, "user-prompt-submit", "{}").unwrap(); // Working
+        store::set_state_for_test(&root, id, WorkerEventKind::Working);
         ingest_session(&root, id).unwrap(); // -> doing
         let working_fp = observable_fingerprint(&root).unwrap();
-        // stable when nothing changes
-        assert_eq!(working_fp, observable_fingerprint(&root).unwrap());
+        assert_eq!(working_fp, observable_fingerprint(&root).unwrap(), "stable when nothing changes");
 
-        record_state(&root, id, "stop", "{}").unwrap(); // Idle, still in doing (no column move)
+        // Idle stays in doing (no column move), but the icon must still flip.
+        store::set_state_for_test(&root, id,
+            WorkerEventKind::HumanInputRequired(Notification::IdlePrompt));
         ingest_session(&root, id).unwrap();
-        let idle_fp = observable_fingerprint(&root).unwrap();
-        assert_ne!(working_fp, idle_fp, "phase change must change the fingerprint even without a card move");
+        assert_ne!(working_fp, observable_fingerprint(&root).unwrap(),
+            "phase change must change the fingerprint even without a card move");
     }
 
     #[test]
     fn session_end_copies_transcript_into_session_dir() {
-        use crate::controller::{apply::apply, handoff};
-        use crate::model::proto::Intent;
-        struct NoLaunch;
-        impl handoff::Launcher for NoLaunch {
-            fn launch(&self, _s: &crate::model::WorkerSession, _n: &str) -> anyhow::Result<()> { Ok(()) }
-            fn kill(&self, _n: &str) {}
-            fn is_alive(&self, _n: &str) -> bool { true }
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".kanban");
-        store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { text: "A".into(),
-            column: "todo".parse().unwrap() }).unwrap();
-        let id = TaskId::new(1);
-        handoff::handoff(&root, id, "claude", &NoLaunch).unwrap(); // writes session.yaml
+        let (d, root, id) = workspace_with_session();
 
-        let tpath = dir.path().join("orig-transcript.jsonl");
+        let tpath = d.path().join("orig-transcript.jsonl");
         std::fs::write(&tpath, "{\"m\":1}\n{\"m\":2}\n").unwrap();
         let payload = format!("{{\"session_id\":\"abc-123\",\"transcript_path\":\"{}\"}}",
             tpath.display());
 
-        record_state(&root, id, "session-end", &payload).unwrap();
+        record_hook(&root, id, "session-end", &payload).unwrap();
 
         let copied = store::session_dir(&root, id).join("transcript.jsonl");
         assert_eq!(std::fs::read_to_string(&copied).unwrap(), "{\"m\":1}\n{\"m\":2}\n");
@@ -641,41 +396,18 @@ mod tests {
     }
 
     #[test]
-    fn session_start_records_session_id() {
-        use crate::controller::{apply::apply, handoff};
-        use crate::model::proto::Intent;
-        struct NoLaunch;
-        impl handoff::Launcher for NoLaunch {
-            fn launch(&self, _s: &crate::model::WorkerSession, _n: &str) -> anyhow::Result<()> { Ok(()) }
-            fn kill(&self, _n: &str) {}
-            fn is_alive(&self, _n: &str) -> bool { true }
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".kanban");
-        store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { text: "A".into(),
-            column: "todo".parse().unwrap() }).unwrap();
-        let id = TaskId::new(1);
-        handoff::handoff(&root, id, "claude", &NoLaunch).unwrap();
-
-        record_state(&root, id, "session-start", "{\"session_id\":\"abc-123\"}").unwrap();
-
+    fn a_hook_payload_records_the_session_id() {
+        let (_d, root, id) = workspace_with_session();
+        record_hook(&root, id, "session-end", "{\"session_id\":\"abc-123\"}").unwrap();
         let s = store::load_session(&root, id).unwrap().unwrap();
         assert_eq!(s.status.session_id.as_deref(), Some("abc-123"));
     }
 
     #[test]
     fn reconcile_all_ingests_each_session() {
-        use crate::controller::apply::apply;
-        use crate::model::proto::Intent;
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(".kanban");
-        store::init_workspace(&root).unwrap();
-        apply(&root, Intent::CreateTask { text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
-        let id = TaskId::new(1);
-        record_state(&root, id, "session-start", "{}").unwrap();
+        let (_d, root, id) = workspace_with_task();
+        store::set_state_for_test(&root, id, WorkerEventKind::Working);
         assert!(reconcile_all(&root).unwrap());
-        let board = store::load_board(&root).unwrap();
-        assert!(board.cards().get(&"doing".parse().unwrap()).unwrap().contains(&id)); // Started -> Working -> doing
+        assert_eq!(column_of(&root, id).as_deref(), Some("doing"));
     }
 }

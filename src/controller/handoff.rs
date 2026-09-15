@@ -173,17 +173,14 @@ pub fn prepare_session(
             "ask": context.ask,
             "deny": context.deny,
         },
+        // The agent reports its own state, so hooks carry only what it cannot
+        // see: the transcript path, and the human-involvement facts behind the
+        // activity log.
         "hooks": {
             "Notification": mk("notification"),
             "Stop": mk("stop"),
-            "SessionStart": mk("session-start"),
             "UserPromptSubmit": mk("user-prompt-submit"),
             "SessionEnd": mk("session-end"),
-            // Bracket each subagent so a Stop that only yields to background work
-            // isn't mistaken for the agent waiting on the human. The Agent tool is
-            // called `Task` on older Claude Code builds and `Agent` on current ones.
-            "PreToolUse": matched("pre-tool-use", "Task|Agent"),
-            "SubagentStop": mk("subagent-stop"),
         },
     });
     let settings_path = sdir.join("hooks/settings.json");

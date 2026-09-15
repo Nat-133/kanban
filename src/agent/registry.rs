@@ -70,6 +70,25 @@ pub fn read(dir: &Path, pid: i32) -> Option<Record> {
     })
 }
 
+/// Find a session's record by its Claude session id, for a caller that knows the
+/// id but not the pid — a hook process, which is handed the id in its payload.
+/// Scans the directory, so prefer `read` when the pid is known.
+pub fn find_by_session_id(dir: &Path, session_id: &str) -> Option<Record> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let pid = entry
+            .file_name()
+            .to_string_lossy()
+            .strip_suffix(".json")
+            .and_then(|s| s.parse::<i32>().ok());
+        let Some(pid) = pid else { continue };
+        match read(dir, pid) {
+            Some(r) if r.session_id.as_deref() == Some(session_id) => return Some(r),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn parse_status(s: &str) -> Option<Status> {
     match s {
         "busy" => Some(Status::Busy),
@@ -127,6 +146,24 @@ mod tests {
         assert!(read(d.path(), 7).is_none());
         write(d.path(), 8, "not json at all");
         assert!(read(d.path(), 8).is_none());
+    }
+
+    #[test]
+    fn finds_a_session_by_its_claude_session_id() {
+        let d = tempfile::tempdir().unwrap();
+        write(d.path(), 10, r#"{"pid":10,"status":"idle","sessionId":"other"}"#);
+        write(d.path(), 11, r#"{"pid":11,"status":"busy","sessionId":"ours"}"#);
+        assert_eq!(find_by_session_id(d.path(), "ours").unwrap().status, Some(Status::Busy));
+        assert!(find_by_session_id(d.path(), "nobody").is_none());
+    }
+
+    #[test]
+    fn a_non_pid_filename_is_skipped_not_fatal() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("notes.txt"), "junk").unwrap();
+        std::fs::write(d.path().join("42.key"), "junk").unwrap();
+        write(d.path(), 11, r#"{"pid":11,"status":"busy","sessionId":"ours"}"#);
+        assert_eq!(find_by_session_id(d.path(), "ours").unwrap().status, Some(Status::Busy));
     }
 
     #[test]

@@ -328,6 +328,23 @@ pub fn save_state(root: &Path, id: TaskId, event: &WorkerEvent) -> anyhow::Resul
     atomic_write(&state_path(root, id), &serde_yml::to_string(event)?)
 }
 
+/// Test-only: assert a session's state directly, standing in for whichever
+/// reporter would have written it.
+#[cfg(test)]
+pub(crate) fn set_state_for_test(root: &Path, id: TaskId, kind: WorkerEventKind) {
+    save_state(
+        root,
+        id,
+        &WorkerEvent {
+            kind,
+            source: "test".into(),
+            observed_at: OffsetDateTime::now_utc(),
+            payload_ref: None,
+        },
+    )
+    .unwrap();
+}
+
 /// Read a session's current state, if it has one yet. A session that has never
 /// emitted a tracked event has no state file.
 pub fn load_state(root: &Path, id: TaskId) -> anyhow::Result<Option<WorkerEvent>> {

@@ -265,7 +265,8 @@ mod tests {
             .send().await.unwrap();
         // the hook would write state then poke; simulate the state write directly
         let id = crate::model::TaskId::new(1);
-        crate::controller::events::record_state(&root, id, "notification", "{\"notification_type\":\"idle_prompt\"}").unwrap();
+        crate::controller::store::set_state_for_test(&root, id,
+            crate::model::WorkerEventKind::HumanInputRequired(crate::model::Notification::IdlePrompt));
 
         // poke and confirm the card landed in doing (needs-human is in-progress)
         poke(&addr.to_string(), id).await.unwrap();
@@ -289,7 +290,7 @@ mod tests {
             text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
         let id = crate::model::TaskId::new(1);
         // place it in `doing` as Working first
-        crate::controller::events::record_state(&root, id, "user-prompt-submit", "{}").unwrap();
+        crate::controller::store::set_state_for_test(&root, id, crate::model::WorkerEventKind::Working);
         crate::controller::events::ingest_session(&root, id).unwrap();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -300,7 +301,8 @@ mod tests {
         loop { if let reqwest_eventsource::Event::Open = es.next().await.unwrap().unwrap() { break; } }
 
         // stop: phase Working -> Idle, still in `doing` (no column move), then poke
-        crate::controller::events::record_state(&root, id, "stop", "{}").unwrap();
+        crate::controller::store::set_state_for_test(&root, id,
+            crate::model::WorkerEventKind::HumanInputRequired(crate::model::Notification::IdlePrompt));
         poke(&addr.to_string(), id).await.unwrap();
 
         let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -322,7 +324,8 @@ mod tests {
         crate::controller::apply::apply(&root, Intent::CreateTask {
             text: "A".into(), column: "todo".parse().unwrap() }).unwrap();
         let id = crate::model::TaskId::new(1);
-        crate::controller::events::record_state(&root, id, "notification", "{\"notification_type\":\"idle_prompt\"}").unwrap();
+        crate::controller::store::set_state_for_test(&root, id,
+            crate::model::WorkerEventKind::HumanInputRequired(crate::model::Notification::IdlePrompt));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

@@ -368,6 +368,9 @@ fn archive(root: &Path, task_id: TaskId, launcher: &dyn handoff::Launcher) -> an
             launcher.kill(name);
         }
     }
+    // Before the session dir moves: a worktree archived in place keeps its
+    // registration in the parent repo and points at a path that no longer exists.
+    crate::controller::git::prune_worktrees(&store::session_dir(root, task_id).join("work"));
     store::archive_session_dir(root, task_id)?;
     // Flag the task archived (kept on disk, hidden from the board)…
     task.status.archived = true;
@@ -642,6 +645,42 @@ mod tests {
         assert!(store::archive_dir(&r).join(id.to_string()).join("session.yaml").exists(),
             "archived session record should be preserved under archive/sessions/");
         assert_eq!(&*fake.killed.lock().unwrap(), &["kanban-task-0001".to_string()]);
+    }
+
+    /// Nobody else can clean up after the agent: by the time a card is archived
+    /// its session is gone. Left behind, the worktree keeps its registration in
+    /// the parent repo and its directory gets moved under archive/ by the next
+    /// step, which breaks both.
+    #[test]
+    fn archive_removes_the_agents_worktree() {
+        let d = setup(); let r = root(&d);
+        apply(&r, Intent::CreateTask { text: "A".into(), column: col("todo") }).unwrap();
+        let id = TaskId::new(1);
+        handoff::handoff(&r, id, "claude", &FakeLauncher::default()).unwrap();
+
+        let repo = d.path().join("repo");
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            let o = std::process::Command::new("git").current_dir(cwd).args(args).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        };
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        git(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("f"), "one").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "init"]);
+        let tree = store::session_dir(&r, id).join("work/repo");
+        git(&repo, &["worktree", "add", "-q", "-b", "task-0001-a", &tree.display().to_string()]);
+        assert!(tree.exists());
+
+        archive(&r, id, &FakeLauncher::default()).unwrap();
+
+        assert!(!tree.exists(), "worktree should be removed before the session dir is archived");
+        let o = std::process::Command::new("git")
+            .current_dir(&repo).args(["worktree", "list"]).output().unwrap();
+        let list = String::from_utf8_lossy(&o.stdout);
+        assert!(!list.contains("task-0001-a"), "worktree should be deregistered: {list}");
     }
 
     #[test]

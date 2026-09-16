@@ -8,3 +8,4 @@ pub mod activity;
 pub mod background;
 pub mod recover;
 pub mod workspace;
+pub mod git;

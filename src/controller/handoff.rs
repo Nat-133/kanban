@@ -81,7 +81,7 @@ pub fn prepare_session(
     // NOT writable by the agent. The agent gets a nested work/ sandbox: its cwd and
     // the only path on its allowlist, holding the handoff and context it may touch.
     std::fs::create_dir_all(sdir.join("hooks"))?;
-    std::fs::create_dir_all(sdir.join("work"))?;
+    std::fs::create_dir_all(sdir.join("work/scratch"))?;
     // Canonicalize to an absolute path: the worker runs with the work dir (or the
     // repo) as its cwd, so the `--settings` and `--add-dir` paths derived from it
     // must be absolute or they won't resolve. A relative `--root` would otherwise
@@ -125,7 +125,7 @@ pub fn prepare_session(
     }
 
     // handoff.md (a read material for the agent, so it lives in work/)
-    std::fs::write(work.join("handoff.md"), render_handoff(task))?;
+    std::fs::write(work.join("handoff.md"), render_handoff(task, &work))?;
 
     // command: worker.command + substituted args + one --add-dir per expanded base dir
     let task_id = id.to_string();
@@ -199,11 +199,12 @@ pub fn prepare_session(
     // would be swallowed by the variadic `--add-dir <dirs...>` that follows.
     command.insert(3, initial_prompt(&work));
 
-    // workdir: the task's repo (tilde-expanded) if set, else the agent's work/ sandbox
-    let workdir = match repo {
-        Some(r) => PathBuf::from(expand_tilde(r)),
-        None => work.clone(),
-    };
+    // workdir is always the agent's own sandbox, never the task's repo. Starting a
+    // worker inside the shared checkout is what let two tasks commit over each
+    // other and switch branches under each other; `spec.repo` now only says which
+    // repo the task is about, and the handoff tells the agent to take a worktree
+    // of it under work/.
+    let workdir = work.clone();
 
     Ok(WorkerSession {
         api_version: ApiVersion::V1Alpha1,
@@ -261,7 +262,29 @@ pub fn handoff(root: &Path, task_id: TaskId, worker_name: &str, launcher: &dyn L
     Ok(())
 }
 
-fn render_handoff(task: &Task) -> String {
+/// The branch a task owns, a pure function of its id and title.
+///
+/// The id prefix is what makes it safe: agents left to name their own branches
+/// converge on the obvious one and then commit over each other, whereas two task
+/// ids cannot collide however alike their titles read.
+pub fn branch_name(task: &Task) -> String {
+    let mut slug = String::new();
+    for c in task.spec.title.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.extend(c.to_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug: String = slug.trim_matches('-').chars().take(40).collect();
+    let slug = slug.trim_end_matches('-');
+    match slug {
+        "" => task.metadata.name.clone(),
+        s => format!("{}-{s}", task.metadata.name),
+    }
+}
+
+fn render_handoff(task: &Task, work: &Path) -> String {
     let mut s = String::new();
     s.push_str(&format!("# Task handoff: {}\n\n", task.metadata.name));
     s.push_str(&format!("## Title\n\n{}\n\n", task.spec.title));
@@ -293,7 +316,69 @@ Work only on this task unless explicitly asked otherwise.\n\
 Do not inspect unrelated task directories.\n\
 Update `notes.md` with useful findings.\n",
     );
+    s.push_str(&render_workspace(task, work));
+    if let Some(repo) = &task.spec.repo {
+        s.push_str(&render_delivery(task, work, repo));
+    }
     s
+}
+
+/// What the sandbox is and which paths outlive it.
+///
+/// Said explicitly because an agent told only to read files in `work/` reads the
+/// directory as a drop-box and puts its own output somewhere else — usually
+/// `/tmp`, where it is invisible to the board and gone by the next session.
+fn render_workspace(task: &Task, work: &Path) -> String {
+    format!(
+        "\n## Your workspace\n\n\
+`{work}` is yours. Create, move and delete inside it as you like — it is the \
+only writable path you have here; everything above it is the controller's.\n\n\
+- `{desc}` and `{notes}` are symlinks that write through to the task directory, \
+so they outlive this sandbox. Nothing else in `{work}` does. A tool that refuses \
+to overwrite one is refusing the link, not the write: edit it in place, or write \
+the link's target.\n\
+- Put scratch work — intermediate results, scripts, dumps — in `{work}/scratch`, \
+NOT in `/tmp` and not in the session scratchpad your harness offers you. Scratch \
+in `/tmp` is invisible on the board and gone when you are resumed; scratch here \
+is still there.\n",
+        work = work.display(),
+        desc = task.spec.description_ref,
+        notes = task.spec.notes_ref,
+    )
+}
+
+/// The repo workflow: your own worktree, your own branch, ending in a draft PR.
+fn render_delivery(task: &Task, work: &Path, repo: &str) -> String {
+    let branch = branch_name(task);
+    let tree = work.join("repo");
+    format!(
+        "\n## Delivery\n\n\
+This task's repo is `{repo}`. Do not work in that checkout — other agents are in \
+it. Take your own worktree:\n\n\
+```sh\n\
+cd {repo}\n\
+git fetch origin\n\
+base=$(git symbolic-ref --short refs/remotes/origin/HEAD)   # e.g. origin/main\n\
+git worktree add -b {branch} {tree} \"$base\"\n\
+cd {tree}\n\
+```\n\n\
+Fetch first, every time, and branch from the remote ref — a local `main` that has \
+not been fetched since the last merge is the usual reason a task replays work that \
+is already upstream. If `{tree}` already exists you are resuming: fetch, say what \
+moved, and rebase only if you decide it is worth it.\n\n\
+Commit as you go on `{branch}`. When the work is done, push it and open a draft \
+PR:\n\n\
+```sh\n\
+git push -u origin {branch}\n\
+gh pr create --draft\n\
+```\n\n\
+Then record the PR url in `{notes}`. A draft PR is where this task ends — do not \
+mark it ready or merge it.\n",
+        repo = repo,
+        branch = branch,
+        tree = tree.display(),
+        notes = task.spec.notes_ref,
+    )
 }
 
 /// Replace `{task_id}` and `{repo}` placeholders. Missing repo -> empty string.
@@ -547,13 +632,128 @@ mod tests {
     #[test]
     fn handoff_md_instructs_scope_first_then_asks_before_implementing() {
         let task = sample_task(crate::model::TaskId::new(1), "x");
-        let md = render_handoff(&task).to_lowercase();
+        let md = render_handoff(&task, Path::new("/w/work")).to_lowercase();
         assert!(md.contains("description.md"), "must point at the description file");
         assert!(md.contains("scope"), "must instruct the agent to narrow scope");
         assert!(
             md.contains("before") && md.contains("implement"),
             "must tell the agent to stop and ask before implementing",
         );
+    }
+
+    #[test]
+    fn branch_name_is_derived_from_id_and_title() {
+        use crate::model::TaskId;
+        let task = sample_task(TaskId::new(95), "Agentic Workflow");
+        assert_eq!(branch_name(&task), "task-0095-agentic-workflow");
+    }
+
+    /// Two agents improvising their own branch names is how they land on one
+    /// branch; the id prefix makes a collision impossible even when the titles
+    /// slug identically.
+    #[test]
+    fn branch_names_of_different_tasks_never_collide() {
+        use crate::model::TaskId;
+        let a = sample_task(TaskId::new(1), "Fix the thing!");
+        let b = sample_task(TaskId::new(2), "fix   the --- thing");
+        assert_eq!(branch_name(&a), "task-0001-fix-the-thing");
+        assert_ne!(branch_name(&a), branch_name(&b));
+    }
+
+    /// A title that is all punctuation must still yield a usable ref.
+    #[test]
+    fn branch_name_survives_a_title_with_no_word_characters() {
+        use crate::model::TaskId;
+        assert_eq!(branch_name(&sample_task(TaskId::new(3), "!!! ???")), "task-0003");
+    }
+
+    #[test]
+    fn handoff_md_names_the_branch_and_the_worktree_recipe() {
+        use crate::model::TaskId;
+        let mut task = sample_task(TaskId::new(95), "Agentic Workflow");
+        task.spec.repo = Some("~/vcs/kanban".into());
+        let md = render_handoff(&task, Path::new("/w/sessions/task-0095/work"));
+        assert!(md.contains("task-0095-agentic-workflow"), "must name the branch: {md}");
+        assert!(md.contains("/w/sessions/task-0095/work/repo"), "must name the worktree path: {md}");
+        assert!(md.contains("git fetch origin"), "must fetch before branching: {md}");
+        assert!(md.contains("git worktree add -b"), "must give the worktree recipe: {md}");
+        assert!(md.contains("origin/"), "must branch from the remote ref, not local: {md}");
+        assert!(md.contains("~/vcs/kanban"), "must say which repo: {md}");
+    }
+
+    #[test]
+    fn handoff_md_ends_the_workflow_at_a_draft_pr() {
+        use crate::model::TaskId;
+        let mut task = sample_task(TaskId::new(95), "x");
+        task.spec.repo = Some("~/vcs/kanban".into());
+        let md = render_handoff(&task, Path::new("/w/work"));
+        assert!(md.contains("gh pr create --draft"), "must end at a draft PR: {md}");
+        assert!(md.contains("notes.md"), "must record the PR url: {md}");
+    }
+
+    /// Without a repo there is nothing to branch, and a worktree recipe would be
+    /// noise the agent has to decide to ignore.
+    #[test]
+    fn handoff_md_omits_the_delivery_recipe_when_the_task_has_no_repo() {
+        use crate::model::TaskId;
+        let task = sample_task(TaskId::new(95), "x"); // repo: None
+        let md = render_handoff(&task, Path::new("/w/work"));
+        assert!(!md.contains("git worktree add"), "no repo -> no worktree recipe: {md}");
+    }
+
+    #[test]
+    fn handoff_md_says_work_is_the_agents_own_and_names_the_durable_files() {
+        use crate::model::TaskId;
+        let md = render_handoff(&sample_task(TaskId::new(1), "x"), Path::new("/w/work"));
+        assert!(md.contains("/w/work"), "must name the work dir: {md}");
+        assert!(md.to_lowercase().contains("yours"), "must say the dir is the agent's own: {md}");
+        assert!(md.contains("symlink"), "must explain the write-through links: {md}");
+        assert!(md.contains("description.md") && md.contains("notes.md"));
+    }
+
+    #[test]
+    fn handoff_md_directs_scratch_into_the_sandbox_not_tmp() {
+        use crate::model::TaskId;
+        let md = render_handoff(&sample_task(TaskId::new(1), "x"), Path::new("/w/work"));
+        assert!(md.contains("/w/work/scratch"), "must name the scratch dir: {md}");
+        assert!(md.contains("/tmp"), "must explicitly override the /tmp default: {md}");
+    }
+
+    #[test]
+    fn prepare_session_creates_the_scratch_dir() {
+        use crate::controller::store;
+        use crate::model::TaskId;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        let task = sample_task(TaskId::new(1), "x");
+        store::save_task(&root, &task).unwrap();
+        let cfg = store::load_config(&root).unwrap();
+        let ctx = cfg.context_for(None);
+        prepare_session(&root, &task, "claude",
+            cfg.workers.get("claude").unwrap(), &cfg.agents.base_dirs, &ctx).unwrap();
+        assert!(root.join("sessions/task-0001/work/scratch").is_dir());
+    }
+
+    /// The shared checkout was the collision: every task on one repo started life
+    /// in it, on whatever branch the last agent left behind.
+    #[test]
+    fn prepare_session_never_starts_the_worker_in_the_shared_checkout() {
+        use crate::controller::store;
+        use crate::model::TaskId;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        let mut task = sample_task(TaskId::new(1), "x");
+        task.spec.repo = Some(dir.path().display().to_string());
+        store::save_task(&root, &task).unwrap();
+        let cfg = store::load_config(&root).unwrap();
+        let ctx = cfg.context_for(None);
+        let session = prepare_session(&root, &task, "claude",
+            cfg.workers.get("claude").unwrap(), &cfg.agents.base_dirs, &ctx).unwrap();
+        let work = std::fs::canonicalize(root.join("sessions/task-0001/work")).unwrap();
+        assert_eq!(session.spec.workdir.as_deref(), Some(work.as_path()),
+            "cwd must be the sandbox, not the repo");
     }
 
     #[derive(Default)]
@@ -623,6 +823,7 @@ mod tests {
         assert_eq!(launched.len(), 1);
         assert_eq!(launched[0].1, "kanban-task-0001");
     }
+
 
     fn sample_task(id: crate::model::TaskId, title: &str) -> crate::model::Task {
         use crate::model::*;

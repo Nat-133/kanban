@@ -49,7 +49,6 @@ workers:
     args:
       - --add-dir
       - .kanban/sessions/{task_id}/work
-    workdir: "{repo}"
     terminal:
       type: tmux
       sessionName: kanban-{task_id}

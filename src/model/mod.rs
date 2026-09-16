@@ -536,8 +536,6 @@ pub struct WorkerConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workdir: Option<String>,
     pub terminal: TerminalConfig,
 }
 

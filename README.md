@@ -47,6 +47,20 @@ one attaches, so two agents can never land on one task.
 
 Nothing in the lifecycle depends on an LLM following prose instructions.
 
+## One task, one branch
+
+A worker starts in its own `work/` sandbox, never in a repo. `spec.repo` says which repo
+the task is *about*; the handoff tells the agent to take its own worktree of it at
+`work/repo`, on branch `task-NNNN-<slug>` — derived from the task id, so two tasks cannot
+name the same branch — cut from the freshly fetched remote default ref rather than a local
+`main` that may be stale. The task ends at a draft PR from that branch.
+
+Taking the worktree is the agent's job, because the controller cannot know whether a task
+is repo work at all. Removing it is the controller's, because by the time a card is
+archived the agent is gone: archiving deregisters any worktree under `work/` and leaves a
+dirty one alone rather than forcing it. The branch is never deleted, so committed work
+outlives the card.
+
 ## Layout
 
 ```text

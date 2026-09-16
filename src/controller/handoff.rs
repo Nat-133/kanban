@@ -243,16 +243,14 @@ pub fn prepare_session(
 /// in an already-built command, so a resume can drop it.
 pub const INITIAL_PROMPT_PREFIX: &str = "Read the task handoff at ";
 
-/// Index of the worker binary within a stored launch command — the first entry
-/// past the supervisor's own `--` separator. Anything that rewrites the worker's
-/// arguments must position itself relative to this, or it hands them to the
-/// supervisor instead.
-///
-/// A command stored before the supervisor existed has no separator, so its
-/// worker binary sits at index 0.
+/// Index of the worker binary within a launch command — the first entry past the
+/// supervisor's own `--` separator. Anything that rewrites the worker's arguments
+/// must position itself relative to this, or it hands them to the supervisor
+/// instead.
 pub fn worker_cmd_start(command: &[String]) -> usize {
     match command.iter().position(|a| a == "--") {
         Some(sep) => sep + 1,
+        // Unsupervised, so the worker leads its own command.
         None => 0,
     }
 }
@@ -591,8 +589,7 @@ mod tests {
 
     #[test]
     fn worker_cmd_start_falls_back_for_an_unwrapped_command() {
-        // A command stored before the supervisor existed has no separator, so its
-        // worker binary is still at index 0.
+        // No separator means nothing is supervising, so the worker leads.
         assert_eq!(worker_cmd_start(&["claude".to_string(), "--settings".to_string()]), 0);
     }
 

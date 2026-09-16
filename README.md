@@ -42,8 +42,9 @@ warning rather than a stuck card.
 
 Agents launched detached can die without emitting anything, so a liveness probe reconciles
 sessions whose terminal has vanished and marks them interrupted. Recovery is
-operator-triggered: opening an interrupted session resumes it with `--resume`; opening a live
-one attaches, so two agents can never land on one task.
+operator-triggered: opening an interrupted session rebuilds its launch command from current
+config and resumes its transcript with `--resume`; opening a live one attaches and leaves it
+alone, so two agents can never land on one task.
 
 Nothing in the lifecycle depends on an LLM following prose instructions.
 

@@ -304,8 +304,7 @@ async fn run_loop(terminal: &mut Term, base: String) -> anyhow::Result<()> {
                     Some(Ok(Event::Paste(text))) => {
                         match term.as_mut() {
                             Some(t) => {
-                                let bracketed = t.parser().read().unwrap().screen().bracketed_paste();
-                                let _ = t.write_input(&encode_paste(&text, bracketed));
+                                let _ = t.write_input(&encode_paste(&text));
                             }
                             None => app.on_paste(&text),
                         }

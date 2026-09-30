@@ -536,6 +536,9 @@ pub struct WorkerConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Model passed as `--model`; opus when unset.
+    #[serde(default)]
+    pub model: Option<String>,
     pub terminal: TerminalConfig,
 }
 

@@ -853,6 +853,19 @@ mod tests {
     }
 
     #[test]
+    fn relaunch_keeps_the_worker_on_opus() {
+        let d = setup(); let r = root(&d);
+        let id = interrupted_task(&r);
+        let launcher = DeadLauncher::default();
+
+        converge(&r, id, None, &launcher, false).unwrap();
+
+        let cmds = launcher.launched.lock().unwrap();
+        let at = cmds[0].iter().position(|a| a == "--model").expect("--model present");
+        assert_eq!(cmds[0][at + 1], "opus");
+    }
+
+    #[test]
     fn relaunch_does_not_re_send_the_handoff_prompt() {
         let d = setup(); let r = root(&d);
         let id = interrupted_task(&r);

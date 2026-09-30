@@ -189,12 +189,21 @@ pub fn prepare_session(
     command.insert(1, settings_path.display().to_string());
     command.insert(1, "--settings".to_string());
 
+    // Pinned here because the user's own Claude settings don't reliably win for a
+    // supervised launch. A `--model` the worker's args already carry is left alone.
+    let mut flags_end = 3;
+    if !command.iter().any(|a| a == "--model" || a.starts_with("--model=")) {
+        command.insert(flags_end, worker.model.clone().unwrap_or_else(|| DEFAULT_MODEL.to_string()));
+        command.insert(flags_end, "--model".to_string());
+        flags_end += 2;
+    }
+
     // Seed Claude's first turn with the task, otherwise it launches into an idle
     // interactive session and never reads the handoff. Insert it right after the
-    // `--settings <path>` pair (now at indices 1 and 2): a leading positional
+    // `--settings <path>` and `--model <m>` pairs: a leading positional
     // could be mistaken for the `[command]` subcommand slot, while a trailing one
     // would be swallowed by the variadic `--add-dir <dirs...>` that follows.
-    command.insert(3, initial_prompt(&work));
+    command.insert(flags_end, initial_prompt(&work));
 
     // Run the worker under the supervisor, not directly: an agent reports its own
     // state, which means something has to be the worker's parent and outlive its
@@ -238,6 +247,8 @@ pub fn prepare_session(
         status: Default::default(),
     })
 }
+
+const DEFAULT_MODEL: &str = "opus";
 
 /// Opening words of the seeded first turn. Stable enough to recognise the prompt
 /// in an already-built command, so a resume can drop it.
@@ -585,6 +596,48 @@ mod tests {
         assert!(cmd.contains(&"--session".to_string()));
         // Everything after the separator is the worker command, untouched.
         assert_eq!(cmd[worker_cmd_start(cmd)], "claude");
+    }
+
+    fn launch_command(edit: impl FnOnce(&mut crate::model::WorkerConfig)) -> Vec<String> {
+        use crate::controller::store;
+        use crate::model::TaskId;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".kanban");
+        store::init_workspace(&root).unwrap();
+        let task = sample_task(TaskId::new(1), "x");
+        store::save_task(&root, &task).unwrap();
+        let cfg = store::load_config(&root).unwrap();
+        let mut worker = cfg.workers.get("claude").unwrap().clone();
+        edit(&mut worker);
+        let ctx = crate::model::PermissionContext::builtin_default();
+        prepare_session(&root, &task, "claude", &worker, &cfg.agents.base_dirs, &ctx)
+            .unwrap().spec.command
+    }
+
+    fn model_of(cmd: &[String]) -> Vec<&String> {
+        cmd.iter().zip(cmd.iter().skip(1)).filter(|(f, _)| *f == "--model").map(|(_, v)| v).collect()
+    }
+
+    #[test]
+    fn the_worker_defaults_to_opus_ahead_of_the_prompt_and_add_dirs() {
+        let cmd = launch_command(|_| {});
+        assert_eq!(model_of(&cmd), ["opus"]);
+        let at = |pred: &dyn Fn(&String) -> bool| cmd.iter().position(pred).unwrap();
+        let model = at(&|a| a == "--model");
+        assert!(model < at(&|a| a.starts_with(INITIAL_PROMPT_PREFIX)));
+        assert!(model < at(&|a| a == "--add-dir"));
+    }
+
+    #[test]
+    fn a_configured_model_replaces_the_default() {
+        let cmd = launch_command(|w| w.model = Some("sonnet".into()));
+        assert_eq!(model_of(&cmd), ["sonnet"]);
+    }
+
+    #[test]
+    fn a_model_already_in_args_is_not_duplicated() {
+        let cmd = launch_command(|w| w.args.splice(0..0, ["--model".to_string(), "haiku".to_string()]).for_each(drop));
+        assert_eq!(model_of(&cmd), ["haiku"]);
     }
 
     #[test]

@@ -87,6 +87,7 @@ is relaxed.
 cargo build --release
 
 kanban init                # create the workspace layout and a default board
+kanban start               # run the daemon and the TUI together (daemon logs to .kanban/daemon.log)
 kanban daemon              # run the controller (default 127.0.0.1:7777)
 kanban tui                 # attach the terminal UI to a running daemon
 kanban activity            # human-involvement log: interruptions, steers, profile changes
